@@ -1,0 +1,42 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "terra-scrub"
+version = "0.1.0"
+description = "Read-only-by-construction inventory, cleanup-candidate and delete-plan toolkit for Terra workspace GCS buckets"
+readme = "README.md"
+license = { text = "BSD-3-Clause" }
+requires-python = ">=3.11"
+authors = [{ name = "Mark Walker", email = "markw@broadinstitute.org" }]
+keywords = ["terra", "firecloud", "gcs", "cromwell", "cleanup", "storage"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Environment :: Console",
+  "Topic :: System :: Archiving",
+]
+dependencies = [
+  "requests>=2.31",
+  "google-auth>=2.20",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.5"]
+
+[project.scripts]
+terra-scrub = "terra_scrub.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/mwalker174/terra-scrub"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/terra_scrub"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

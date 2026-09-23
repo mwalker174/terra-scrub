@@ -1,0 +1,21 @@
+__pycache__/
+*.pyc
+.venv/
+dist/
+build/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.DS_Store
+# run artifacts (snapshots, contexts, manifests, plans) never belong in the repo
+runs/
+*.jsonl
+*.terra.json
+*.plan.json
+*.plan.sh
+*.cleanup.tsv
+*.protected.tsv
+
+# local harness state
+.claude/settings.local.json
+.claude/.headroom_*

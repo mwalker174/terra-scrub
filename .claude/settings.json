@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "deny": [
+      "Edit(**/*.plan.sh)",
+      "Write(**/*.plan.sh)",
+      "Bash(bash **/*.plan.sh*)",
+      "Bash(sh **/*.plan.sh*)",
+      "Bash(terra-scrub approve *)",
+      "Bash(* terra-scrub approve *)",
+      "Bash(* -m terra_scrub approve *)",
+      "Bash(gsutil rm *)",
+      "Bash(gsutil -m rm *)",
+      "Bash(gcloud storage rm *)",
+      "Bash(gcloud storage objects delete *)"
+    ]
+  }
+}
