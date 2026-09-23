@@ -321,7 +321,7 @@ def run(args: argparse.Namespace) -> int:
     check(not soft_bad, f"soft-deleted copies exist with matching md5 for "
                         f"{soft_ok}/{len(planned)} ({soft_bad[:2]})")
     if windows:
-        print(f"     reversible until: {sorted(windows)}  "
+        print(f"     reversible until: {', '.join(sorted(windows))}  "
               f"(restore '<uri>#<generation>' with the Cloud Storage CLI's objects "
               f"restore; restores land in STANDARD with a fresh generation and a reset "
               f"creation time -- see docs/SAFETY.md §8)")

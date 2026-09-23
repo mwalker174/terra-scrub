@@ -17,6 +17,11 @@ from terra_scrub import __version__
 
 # (command name, module path, help). Order = order shown in --help.
 COMMANDS = [
+    # --- the three-command workflow (workspace-addressed; state under ~/.terra-scrub) ---
+    ("scan",       "terra_scrub.scan",       "capture a workspace bucket and build its delete PLAN (read-only)"),
+    ("status",     "terra_scrub.status",     "show the latest scan/plan for a workspace and whether it can be cleaned"),
+    ("clean",      "terra_scrub.clean",      "arm and run the latest plan for a workspace, then verify (human step)"),
+    # --- low-level building blocks ---
     ("snapshot",   "terra_scrub.snapshot",   "enumerate a bucket -> JSONL snapshot (GET only)"),
     ("context",    "terra_scrub.terra",      "capture Terra workspace attrs, referenced URIs, submissions"),
     ("workspaces", "terra_scrub.terra",      "list workspaces visible to you (optionally by namespace)"),

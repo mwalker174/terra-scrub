@@ -18,7 +18,8 @@ import pytest
 import terra_scrub
 
 PKG = os.path.dirname(terra_scrub.__file__)
-GET_ONLY = ["http", "util", "snapshot", "terra", "analyze", "candidates", "plan", "verify"]
+GET_ONLY = ["http", "util", "snapshot", "terra", "analyze", "candidates", "plan", "verify",
+            "runs", "scan", "status"]
 
 MUTATING_HTTP = {"post", "put", "patch", "delete"}
 # Imports that can shell out, touch the network outside api_get, or mutate the

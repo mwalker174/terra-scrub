@@ -1,11 +1,62 @@
 # terra-scrub
 
-A toolkit for finding reclaimable storage in Terra workspace GCS buckets and writing
-auditable delete plans for it. It is read-only by construction: nothing in the package
-deletes an object. It lists the bucket, reads the Terra workspace (attributes, entity
-references, submissions), builds delete and review lists under explicit guards,
-re-checks each row against live GCS, and writes a plan. The last step is a wrapper
-script that stays inert until a human arms it.
+Finds reclaimable storage in a Terra workspace bucket, builds an auditable delete plan
+for it, and, once a person types the plan's id, runs that plan and proves what it
+removed. From a dirty workspace to a clean one takes three commands:
+
+```bash
+terra-scrub scan   my-ns/my-ws     # read-only: list, read Terra, build + live-check a plan
+terra-scrub status my-ns/my-ws     # what the latest scan found, and whether it can be cleaned
+terra-scrub clean  my-ns/my-ws     # YOU type the plan id; it runs the plan, then verifies
+```
+
+A session looks like this (abridged):
+
+```text
+$ terra-scrub scan my-ns/my-ws --reference-list delivered/callset_v1/sample_map.tsv
+== scan my-ns/my-ws ==
+  target:            my-ns/my-ws
+  bucket:            gs://fc-1234abcd-5678-90ef-aaaa-bbbbccccdddd
+  snapshot:          184,212 objects, 41.87 TiB
+  delete candidates: 61,904 objects, 12.31 TiB
+  review list:       2,118 rows, 402.55 GiB  ~/.terra-scrub/runs/my-ns/my-ws/20260923T141502Z/cleanup/fc-1234abcd-5678-90ef-/fc-1234abcd-5678-90ef-aaaa-bbbbccccdddd.cleanup.protected.tsv
+  plan:              3f9c0a7e21bd  61,904 objects, 12.31 TiB  executable: yes
+  outcome:           planned
+  run dir:           ~/.terra-scrub/runs/my-ns/my-ws/20260923T141502Z
+  next:              terra-scrub clean my-ns/my-ws
+
+$ terra-scrub status my-ns/my-ws
+== status my-ns/my-ws ==
+  latest run:  20260923T141502Z  (0.4 h ago)
+  bucket:      gs://fc-1234abcd-5678-90ef-aaaa-bbbbccccdddd
+  plan:        3f9c0a7e21bd  61,904 objects, 12.31 TiB  executable: yes
+  age:         manifest 0.4 h, plan 0.4 h -> fresh
+  wrapper:     not armed
+  next:        terra-scrub clean my-ns/my-ws
+
+$ terra-scrub clean my-ns/my-ws
+== terra-scrub clean my-ns/my-ws ==
+   bucket    : gs://fc-1234abcd-5678-90ef-aaaa-bbbbccccdddd
+   plan id   : 3f9c0a7e21bd
+   delete    : 61,904 objects, 12.31 TiB (13,534,915,011,584 bytes)
+   age       : manifest 0.5 h, plan 0.4 h (limit 24 h)
+   re-checks : URI list sha256 + line count verified; pointer check on
+   wrapper   : ~/.terra-scrub/runs/my-ns/my-ws/20260923T141502Z/cleanup/fc-1234abcd-5678-90ef-/fc-1234abcd-5678-90ef-aaaa-bbbbccccdddd.cleanup.tsv.plan.sh
+   review    : ~/.terra-scrub/runs/my-ns/my-ws/20260923T141502Z/cleanup/fc-1234abcd-5678-90ef-/fc-1234abcd-5678-90ef-aaaa-bbbbccccdddd.cleanup.tsv
+   NOTE      : recovery afterwards is a soft-delete restore, and only inside the bucket's soft-delete window (GCS default 7 days; it can be 0) -- docs/SAFETY.md §8
+Type the plan id to delete 61,904 objects (12.31 TiB) from gs://fc-1234abcd-5678-90ef-aaaa-bbbbccccdddd, or anything else to abort: 3f9c0a7e21bd
+
+ARMED: CONFIRM=3f9c0a7e21bd written into ...cleanup.tsv.plan.sh
+-- running ...cleanup.tsv.plan.sh (log: .../logs/clean.log)
+-- verifying (log: .../logs/verify.log)
+RESULT: ALL CHECKS PASS
+
+CLEANED my-ns/my-ws: 61,904 objects, 12.31 TiB freed; verify OK -- soft-delete restore window until 2026-09-30T14:40
+```
+
+Read the manifest TSV the summary points at before you type the id. Typing it is the
+approval. `terra-scrub clean my-ns/my-ws --dry-run` does every check and prints the
+summary without arming or running anything.
 
 ## Install
 
@@ -16,30 +67,22 @@ gcloud auth application-default login
 
 Python 3.11 or newer. Every GCS and Terra call uses your application-default
 credentials. Set `TERRA_API_URL` to point at a Terra API other than
-`https://api.firecloud.org`.
-
-## Quickstart (one bucket)
-
-```bash
-R=runs/manual && mkdir -p $R/inv $R/cleanup/mybucket
-terra-scrub lookup fc-1234abcd-...                             # -> namespace / workspace
-terra-scrub snapshot fc-1234abcd-... --out $R/inv/mybucket.jsonl      # listing FIRST
-terra-scrub context my-ns my-ws --out $R/inv/mybucket.terra.json      # then Terra
-terra-scrub report $R/inv/mybucket.jsonl                               # where the bytes are
-terra-scrub candidates --snapshot $R/inv/mybucket.jsonl --terra $R/inv/mybucket.terra.json \
-    --out-dir $R/cleanup/mybucket --max-snapshot-age 1
-terra-scrub context my-ns my-ws --out $R/inv/mybucket.plan-time.terra.json   # fresh
-terra-scrub plan --manifest $R/cleanup/mybucket/fc-1234abcd-....cleanup.tsv \
-    --terra $R/inv/mybucket.plan-time.terra.json
-terra-scrub approve --root $R <plan_id>        # HUMAN step, then: bash <...>.plan.sh
-terra-scrub verify --plan $R/cleanup/mybucket/fc-1234abcd-....cleanup.tsv.plan.json
-```
-
-For many buckets, use `terra-scrub estate scan --namespace NS ...` followed by
-`terra-scrub estate plan --root ...`. [docs/WORKFLOW.md](docs/WORKFLOW.md) walks
-through both paths.
+`https://api.firecloud.org`. `scan`/`status`/`clean` keep their state under
+`~/.terra-scrub` (override with `TERRA_SCRUB_HOME` or `--home`).
 
 ## Commands
+
+| command | what it does |
+|---|---|
+| `scan <ns>/<ws>` | snapshot → context → candidates → fresh context → plan, into a new run dir (read-only) |
+| `status <ns>/<ws>` | the latest run for a workspace: outcome, plan id, size, freshness, armed state |
+| `clean <ns>/<ws>` | re-check the latest plan, take the typed plan id, run the wrapper, verify (a human step) |
+
+### Under the hood (advanced)
+
+`scan` and `clean` drive the low-level commands below. Use them directly to run steps
+by hand, to split roles (someone plans, someone else approves), or across a whole
+estate. [docs/WORKFLOW.md](docs/WORKFLOW.md) covers both.
 
 | command | what it does |
 |---|---|
@@ -58,21 +101,27 @@ through both paths.
 
 ## Safety model
 
-- **Read-only by construction.** The analysis and planning modules issue HTTP GET
-  only, through a single network primitive. An AST lint in the test suite fails the
-  build if any of them gains a mutating verb, a `subprocess` import or an
-  `--execute`-style flag.
+- **Delete-free, except `clean`.** Every module but `clean` issues HTTP GET only,
+  through a single network primitive. An AST lint in the test suite fails the build if
+  any of them gains a mutating verb, a `subprocess` import or an `--execute`-style
+  flag. `clean` deletes only by running the plan's own wrapper, after the same
+  re-checks `approve` performs and after a person types the plan id.
 - **Ordering is enforced.** The bucket listing has to be captured before the Terra
   context. A plan needs a context captured after its manifest was generated. Both
-  rules are refusals in the code.
+  rules are refusals in the code, and `scan` runs the steps in that order.
 - **Guards G1–G9** keep deliverables, last copies, Cromwell provenance, zero-byte
   markers, index/data pairs and anything named in a reference list off the delete
   list.
-- **Two-man rule.** `plan` writes a wrapper that refuses to run. `approve`, run by a
-  person, writes the plan's id into it. The recommended agent deny-rules stop an AI
-  assistant from arming or running a wrapper on its own.
-- **Verify afterwards.** `verify` re-lists the bucket and proves that exactly the
-  planned set disappeared.
+- **Two-man rule.** `plan` writes a wrapper that refuses to run. It is armed only when
+  a person types the plan id, at `clean`'s prompt or to `approve`. The wrapper
+  re-checks its URI list's sha256 before deleting. This repo's
+  `.claude/settings.json` stops an AI assistant from running `approve`, `clean` or a
+  wrapper.
+- **Stale plans are refused.** A manifest or plan older than 24 h cannot be armed. Run
+  `scan` again.
+- **Verify afterwards.** `clean` runs `verify`, which re-lists the bucket and checks
+  that exactly the planned set disappeared, that keepers and Terra-referenced objects
+  survive, and that soft-deleted copies exist.
 
 [docs/SAFETY.md](docs/SAFETY.md) gives the reasoning behind each rule.
 
@@ -82,7 +131,8 @@ through both paths.
 pip install -e .[dev] && pytest
 ```
 
-The tests run offline: no network, GCS, Terra, gcloud or gsutil.
+The tests run offline: no network, GCS, Terra, gcloud or gsutil, and no wrapper is
+ever executed.
 
 ## Provenance
 

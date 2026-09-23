@@ -288,7 +288,12 @@ def run(args: argparse.Namespace) -> int:
     if prefix and not prefix.endswith("/"):
         prefix += "/"
 
-    if referenced:
+    # The pointer check is ON when a fresh context was GIVEN -- even one with zero
+    # referenced URIs, which is a legitimate answer ("nothing points at anything") for
+    # a workspace whose tables carry no gs:// attributes. It is OFF only when no
+    # context was passed at all. (Testing `referenced` here conflated the two.)
+    pointer_check = bool(ctx_ages)
+    if pointer_check:
         print(f"   live pointer check: ON ({len(referenced):,} referenced URIs from "
               f"{len(ctx_ages)} context(s), newest "
               f"{max(c for _, c in ctx_ages).isoformat()})")
@@ -413,7 +418,7 @@ def run(args: argparse.Namespace) -> int:
     uri_blob = "\n".join(uri_list) + ("\n" if uri_list else "")
     uri_sha = hashlib.sha256(uri_blob.encode()).hexdigest()
     reasons = []
-    if not referenced:
+    if not pointer_check:
         reasons.append("pointer check OFF: no --terra context, so nothing re-checked for new references")
     if review_only:
         reasons.append(f"review list (kind={meta['kind']}): never deletable by this tool")
@@ -427,7 +432,7 @@ def run(args: argparse.Namespace) -> int:
 # from {os.path.basename(args.manifest)} (plan_id {plan_id}, sha256 of the URI list
 # {uri_sha}, {n_del:,} objects / {b_del:,} bytes).
 #
-# Reviewed pointers re-checked live at plan time: {'ON' if referenced else 'OFF -- DO NOT RUN THIS'}
+# Reviewed pointers re-checked live at plan time: {'ON' if pointer_check else 'OFF -- DO NOT RUN THIS'}
 # Recovery after this runs is a soft-delete restore, and only inside the bucket's
 # soft-delete window. That window is set by the bucket's softDeletePolicy (the GCS
 # default is 7 days; it can be 0, i.e. no recovery at all). Check the policy on
@@ -511,7 +516,7 @@ exec gcloud storage rm -I < "{os.path.abspath(out_uris)}"
             "manifest_generated": meta["generated"], "manifest_age_hours": round(age_h, 2),
             "manifest_sha256": f"{plan_id}...", "snapshot_utc": meta.get("snapshot"),
             "prefix": prefix, "limit": args.limit, "rows": len(rows),
-            "pointer_check": "on" if referenced else "off",
+            "pointer_check": "on" if pointer_check else "off",
             "contexts": [{"path": p, "captured_utc": c.isoformat()} for p, c in ctx_ages],
             "plan_objects": n_del, "plan_bytes": b_del,
             "objects_by_status": tally, "bytes_by_status": bytes_by,

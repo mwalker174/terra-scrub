@@ -1,14 +1,121 @@
 # terra-scrub workflow
 
-There are two ways to run terra-scrub. The single-bucket path runs every step by hand,
-which is the best way to learn the tool. The estate path uses drivers to cover every
-bucket in one or more Terra namespaces. Both paths end the same way: a person approves
-each plan and runs its wrapper, then verifies the result.
+The normal path is three workspace-addressed commands: `scan`, `status`, `clean`.
+They keep their state under `~/.terra-scrub` and drive the low-level commands for
+you, in the order the safety rules require. The low-level commands are still there
+for running steps by hand, splitting roles (one person plans, another approves), or
+covering a whole estate; see [Advanced: by hand](#advanced-by-hand).
 
-Read [SAFETY.md](SAFETY.md) first. It explains why each step below is in the order it
-is.
+Read [SAFETY.md](SAFETY.md) first. It explains why each step is in the order it is.
 
-## Run layout
+## The three commands
+
+**1. Scan** (read-only; safe for anyone, including an AI assistant):
+
+```bash
+terra-scrub scan my-ns/my-ws \
+    --reference-list delivered/callset_v1/sample_map.tsv \
+    --reference-list delivered/callset_v1/gvcf_list.txt
+```
+
+It resolves the workspace's bucket and, into a new run directory, takes the snapshot,
+then the Terra context, builds the candidate lists (guards G1–G9), captures a fresh
+context, and runs `plan` against live GCS. It ends by printing the plan id, the
+object count and bytes, and the next command.
+
+- `--reference-list FILE` (repeatable) names files whose contents point at objects,
+  such as a joint-calling sample map, a gVCF list or a delivery manifest. Any object
+  named in one stays off both lists (G8), and deliverable-grade products of the
+  samples in column 1 are never promoted (G9). If a callset was built from this
+  workspace, pass its maps: Terra attributes (G3) cannot see pointers inside files.
+- `--aborted-last-copy-deletable` is the data owner's policy that last copies under
+  Aborted/Failed submissions may go (reason `ABORTED_LAST_COPY`). Without it those
+  rows stay on the protected review list, which never gets a wrapper. Rows without an
+  md5 are never promoted, and G8/G9 still apply. Use it only when the owner has
+  decided it.
+
+**2. Status** (read-only):
+
+```bash
+terra-scrub status my-ns/my-ws
+```
+
+It shows the latest run: outcome, bucket, plan id, objects and bytes, the manifest and
+plan ages computed now, and whether the wrapper is armed. When the plan is more than
+24 h old it reports it as stale and tells you to re-run `terra-scrub scan`, because
+`clean` would refuse it. After a clean it shows the verify result.
+
+**3. Clean** (a person, at a terminal):
+
+```bash
+terra-scrub clean my-ns/my-ws --dry-run     # every check + the summary; arms nothing
+terra-scrub clean my-ns/my-ws               # prompts for the plan id
+```
+
+`clean` takes the latest run, repeats every check `approve` makes (delete manifest,
+executable, manifest and plan under 24 h, URI list sha256 and line count, wrapper
+present and unarmed), and prints a summary: bucket, plan id, objects and bytes,
+ages, the soft-delete caveat and the path to the manifest TSV. Read that TSV. Then
+it asks:
+
+```text
+Type the plan id to delete 61,904 objects (12.31 TiB) from gs://fc-..., or anything else to abort:
+```
+
+Typing the plan id arms the wrapper (`CONFIRM=<plan_id>`), runs it, and then runs
+`verify`. The last line is `CLEANED <ns>/<ws>: N objects, X freed; verify OK -- soft-delete
+restore window until ...` or a `FAILED` line naming the verify log. Anything other than
+the plan id aborts with exit 1 and arms nothing.
+
+- `--confirm <plan_id>` gives the id up front (for a non-interactive shell). Without a
+  TTY and without `--confirm`, `clean` refuses. The value still has to be the plan id.
+- `--skip-verify` leaves verification to you (`terra-scrub verify --plan ...`); the
+  run is recorded as `cleaned-unverified`.
+- `--workers N` sets verify's parallel GETs (default 24).
+- If someone already armed the wrapper with `approve`, `clean` does not re-arm it. It
+  still asks for the plan id before running it.
+- If the wrapper's own self-check refuses (for example, the URI list changed), `clean`
+  exits 1 without verifying. Any other wrapper failure goes to `verify`, which shows
+  what a partial run removed. Re-scan rather than retry.
+
+Check the bucket's soft-delete policy before cleaning. The window may be 0 (SAFETY.md
+§8).
+
+### Where the state lives
+
+`<home>` is `$TERRA_SCRUB_HOME` or `~/.terra-scrub` (every command also takes
+`--home`). Each scan is one run directory, never reused:
+
+```
+<home>/runs/<namespace>/<workspace>/<UTC stamp>/
+    inv/<key>.jsonl                      snapshot (must carry __done__)
+    inv/<key>.terra.json                 context captured AFTER the snapshot
+    inv/<key>.plan-time.terra.json       fresh context captured AFTER the manifest
+    cleanup/<key>/<bucket>.cleanup.tsv   delete manifest
+    cleanup/<key>/<bucket>.cleanup.protected.tsv
+    cleanup/<key>/<bucket>.cleanup.tsv.plan.json / .plan.uris.txt / .plan.sh
+    logs/<step>.log                      stdout+stderr of each step (incl. clean.log, verify.log)
+    run.json                             target, bucket, stamps, outcome
+```
+
+`run.json`'s `outcome` is `planned` after a scan that produced an executable plan;
+`clean` needs that. `clean` adds `armed_utc`, `clean_rc`, `cleaned_utc`, `verify_rc`,
+`verified_utc`, `deleted_objects`, and sets `outcome` to `cleaned`,
+`cleaned-verify-failed` or `cleaned-unverified`. A cleaned run cannot be cleaned
+again; scan again.
+
+---
+
+# Advanced: by hand
+
+There are two ways to run the low-level commands. The single-bucket path runs every
+step by hand, which is the best way to learn the tool. The estate path uses drivers to
+cover every bucket in one or more Terra namespaces. Both end the same way: a person
+approves each plan and runs its wrapper, then verifies the result. This is also the
+path for split roles, where an assistant or a colleague prepares plans and the owner
+approves them.
+
+## Run layout (low-level commands)
 
 Keep each capture in its own root and never reuse an old one. The estate drivers
 create this layout, and `verify` uses it to find the "before" snapshot.
@@ -202,5 +309,13 @@ A refusal is the tool doing its job. Fix the cause. Do not work around the gate.
 | plan older than 24 h, manifest still fresh (`approve`) | the live re-check behind the plan has expired | re-run `estate plan` / `plan` |
 | URI list sha256 changed (`approve`, or the armed wrapper) | the delete set changed after planning | re-plan; never hand-edit the URI list |
 | already armed (`approve`) | the token is already written | run the wrapper, or re-plan to get a new plan_id |
+| no scan for ns/ws (`clean`) | nothing under `~/.terra-scrub/runs/<ns>/<ws>/` | run `terra-scrub scan <ns>/<ws>` (or pass the right `--home`) |
+| outcome is not `planned` / no plan.json (`clean`) | the latest scan did not produce an executable plan, or it was already cleaned | `terra-scrub status <ns>/<ws>` says why; re-run `terra-scrub scan` |
+| any `approve` re-check fails (`clean`): stale manifest or plan, sha256 changed, not executable, wrapper missing | same as the `approve` rows above | re-run `terra-scrub scan <ns>/<ws>` for a fresh plan |
+| wrapper armed with another token / not this run's wrapper (`clean`) | someone armed or edited it by hand | re-run `terra-scrub scan` |
+| not interactive; pass `--confirm <plan_id>` (`clean`) | no TTY to type the id at | run it in a terminal, or pass `--confirm` with the plan id |
+| ABORTED: plan id not typed / `--confirm` does not match (`clean`, exit 1) | the confirmation did not match; nothing was armed | read the plan and type its id, or stop |
+| REFUSED by the wrapper's own self-check (`clean`) | the wrapper refused before deleting (e.g. URI list changed) | re-run `terra-scrub scan`; never hand-edit the URI list |
+| FAILED ... verify rc=1 (`clean`) | see the verify row below; `logs/verify.log` has the details | stop. Read the log before doing anything else |
 | `REFUSED` / `CTX-RC` / `NO-WS` (`estate plan`) | see `logs/plan-<key>.log` | handle the underlying refusal per the rows above |
 | verify check fails | something other than the planned set changed, or a keeper is missing | stop. Check soft-deleted copies (check 5) while still inside the retention window |

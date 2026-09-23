@@ -479,3 +479,26 @@ def test_non_executable_replan_leaves_uri_list(tmp_path, run_plan_with_stub, liv
     assert r3.returncode == 0 and _load(tsv + ".plan.json")["executable"] is False
     with open(tsv + ".plan.uris.txt", "rb") as f:
         assert f.read() == uris_before
+
+
+def test_context_with_zero_references_still_counts_as_pointer_check(tmp_path, run_plan_with_stub):
+    """A FRESH context that happens to reference nothing is a legitimate answer
+    ("nothing points at anything"), not the absence of a context. The pointer check
+    is ON, and the plan is executable. Conflating the two left every workspace
+    whose tables carry no gs:// attributes permanently un-cleanable."""
+    tsv, fresh = make_plan_inputs(tmp_path / "plan-zero-refs")
+    with open(fresh) as f:
+        ctx = json.load(f)
+    ctx["referenced_gs_uris"] = []
+    with open(fresh, "w") as f:
+        json.dump(ctx, f)
+    restamp_context(fresh)
+    r = run_plan_with_stub("--manifest", tsv, "--terra", fresh, "--workers", "4")
+    assert r.returncode == 0, r.stderr[-300:]
+    assert "live pointer check: ON (0 referenced URIs" in r.stdout, r.stdout[-500:]
+    p = _load(tsv + ".plan.json")
+    assert p["pointer_check"] == "on" and p["executable"] is True, p.get("not_executable_reason")
+    assert os.path.exists(tsv + ".plan.sh"), "an executable plan gets its wrapper"
+    # the referenced d6 is now unreferenced in this context, so it may be planned;
+    # what matters here is that nothing was BLOCKED for lack of a context
+    assert not any("pointer check OFF" in x for x in p["not_executable_reason"])

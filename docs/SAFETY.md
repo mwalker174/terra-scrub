@@ -17,8 +17,15 @@ follows from treating a delete as irreversible.
 "Read-only" here is a property the code has, checked by a test. It is not a promise in
 the README.
 
+**Precisely:** every module except `clean` is delete-free. None of them calls a delete
+API or runs the delete wrapper. `clean` is the one module that runs a delete, and it
+does so only by running the plan's own wrapper (`bash <manifest>.plan.sh`). It runs
+the wrapper only after it has repeated every re-check `approve` performs and a person
+has typed the plan id at its prompt (or passed it as `--confirm`). The deny rules in
+§7 stop AI agents from running `clean` at all.
+
 **GET-only modules:** `http`, `util`, `snapshot`, `terra`, `analyze`, `candidates`,
-`plan`, `verify`.
+`plan`, `verify`, `runs`, `scan`, `status`.
 
 - **GET only.** Every GCS JSON-API and Terra API call in those modules is a `GET`:
   through `http.api_get` (bucket listing, workspaces, attributes, paged entities,
@@ -37,8 +44,14 @@ the README.
   URI list and a shell wrapper, and the wrapper holds the only deleter invocation in
   the package: `exec gcloud storage rm -I < <uris>`, the same stdin URI-list format
   that `gsutil rm -I` / FISS `mop` used.
-  terra-scrub never runs that wrapper.
+  Only `clean` runs that wrapper, on a person's typed confirmation. No other module
+  runs it.
 - **Exempt modules, and why:**
+  - `clean` runs one subprocess, `["bash", <run>/.../<manifest>.plan.sh]`, the
+    wrapper that `plan` wrote. It arms the wrapper through `approve.arm` and verifies
+    in-process through `verify`. The source names no cloud CLI (a test in
+    `tests/test_clean.py` checks there is no `gsutil`/`gcloud` string and exactly one
+    subprocess call, whose argv starts with `bash`). The wrapper does the delete.
   - `approve` writes a single token (`CONFIRM=<plan_id>`) into a local wrapper file.
     It makes no network calls.
   - `estate` runs terra-scrub's own commands as subprocesses
@@ -261,14 +274,46 @@ only, `<manifest>.plan.uris.txt` (one `gs://` URI per line, the `gcloud storage 
 
 ## 7. The two-man rule
 
-Deleting is a deliberate act that the owner approves. It takes three separate actions:
+Deleting is a deliberate act that the owner approves. There are two ways to get from
+a plan to a delete. Both go through the same re-checks and the same wrapper.
+
+**Path A: `terra-scrub clean <ns>/<ws>` (a person at a terminal).** `scan` builds the
+plan and `clean` finishes it:
+
+1. It takes the latest run for the workspace (`~/.terra-scrub/runs/<ns>/<ws>/<stamp>/`)
+   and refuses unless `run.json` says `outcome: planned` and the run has a `plan.json`.
+2. It runs `approve.recheck` on that plan, the same function `approve` uses (the list
+   is below). Any failure is a refusal that tells you to re-run `terra-scrub scan`. A
+   wrapper that is already armed with this plan's id (someone ran `approve` by hand)
+   is accepted and not re-armed. A wrapper armed with any other token is refused.
+3. It prints the bucket, the plan id, the object count and bytes, the manifest and plan
+   ages, the soft-delete caveat and the path to the manifest TSV for review.
+4. The person types the plan id at the prompt `Type the plan id to delete N objects
+   (X GiB) from gs://<bucket>, or anything else to abort:`, or passes
+   `--confirm <plan_id>`. Anything else aborts with exit 1 and arms nothing. With no
+   TTY and no `--confirm`, it refuses. `--dry-run` stops before arming and writes
+   nothing.
+5. It writes `CONFIRM=<plan_id>` through `approve.arm`, runs `bash <wrapper>` (the
+   wrapper repeats its own checks, step 3 below), and then runs `verify` in-process.
+   Output goes to `logs/clean.log` and `logs/verify.log`. `run.json` records
+   `armed_utc`, `clean_rc`, `cleaned_utc`, `verify_rc`, `verified_utc` and
+   `outcome` (`cleaned` or `cleaned-verify-failed`). If the wrapper's own self-check
+   refuses, `clean` exits 1 without verifying. Any other non-zero exit still goes to
+   `verify`, because verify is what shows what a partial run removed.
+
+Typing the plan id plays the part of `approve`. It is done by a person and is denied to
+AI agents (the rules below).
+
+**Path B: `plan` / `approve` / wrapper (split roles, or an agent does the prep).** Three
+separate actions:
 
 1. **plan** (anyone, including an AI assistant): produces the wrapper. The wrapper
    refuses to run while `CONFIRM` is empty.
 2. **approve** (a person): `terra-scrub approve <plan_id>`. Typing the 12-character
    `plan_id` is the approval. It has to match exactly one plan on disk, so nobody can
    approve "whatever plan happens to be newest". Before writing the token, `approve`
-   checks each of the following and refuses if any fails:
+   (and `clean`, through the same function) checks each of the following and refuses
+   if any fails:
    - the plan is `manifest_kind=delete` and `executable=true`
    - the manifest is under 24 h old **and** the plan is under 24 h old, both computed
      *now* from the stamps. `plan.json`'s recorded `manifest_age_hours` is frozen at
@@ -276,8 +321,8 @@ Deleting is a deliberate act that the owner approves. It takes three separate ac
    - the URI list's current sha256 equals the one recorded in `plan.json`, and its line
      count equals `plan_objects`, so the token certifies one specific delete set, byte
      for byte
-   - the wrapper exists and its `CONFIRM` is still empty. An armed plan is never
-     re-armed
+   - the wrapper exists and its `CONFIRM` is still empty. `approve` never re-arms an
+     armed plan
 3. **run** (a person, or an assistant a person has told to run it): `bash <...>.plan.sh`.
    Behind the `CONFIRM` gate, the wrapper repeats the URI-list check itself before it
    deletes: the list's sha256 (via `sha256sum`, or `shasum -a 256`; it refuses if
@@ -294,7 +339,8 @@ executable flag and armed state.
 ### Recommended deny rules for AI coding assistants
 
 If an AI assistant works in the same checkout, stop it from arming or running a wrapper
-itself. For Claude Code, add this to `.claude/settings.json` (project) or
+itself, including through `clean`. This repository's `.claude/settings.json` ships
+these rules; for another checkout, add them to its `.claude/settings.json` or to
 `~/.claude/settings.json`:
 
 ```json
@@ -303,15 +349,26 @@ itself. For Claude Code, add this to `.claude/settings.json` (project) or
     "deny": [
       "Edit(**/*.plan.sh)",
       "Write(**/*.plan.sh)",
+      "Bash(bash **/*.plan.sh*)",
+      "Bash(sh **/*.plan.sh*)",
       "Bash(terra-scrub approve *)",
-      "Bash(bash **/*.plan.sh)"
+      "Bash(* terra-scrub approve *)",
+      "Bash(* -m terra_scrub approve *)",
+      "Bash(terra-scrub clean *)",
+      "Bash(* terra-scrub clean *)",
+      "Bash(* -m terra_scrub clean *)",
+      "Bash(gsutil rm *)",
+      "Bash(gsutil -m rm *)",
+      "Bash(gcloud storage rm *)",
+      "Bash(gcloud storage objects delete *)"
     ]
   }
 }
 ```
 
-With these rules the assistant can build and explain a plan but cannot approve it. The
-only way a plan gets armed is a person typing its id.
+With these rules the assistant can run `scan` and `status`, and build and explain a
+plan, but it cannot approve or clean. A plan gets armed only when a person types its
+id, either to `approve` or at `clean`'s prompt.
 
 ---
 
@@ -353,8 +410,10 @@ to fix a plan you did not read.
 
 ## 9. What terra-scrub deliberately does not do
 
-- **It never deletes.** No module calls a delete API, and the one `gcloud storage rm` is inside
-  a wrapper that a person arms and runs.
+- **It never deletes on its own.** No module calls a delete API. The one
+  `gcloud storage rm` is inside a wrapper, and the wrapper runs only when a person
+  runs it by hand after `approve`, or when `clean` runs it after the person types the
+  plan id.
 - It never moves, renames, re-copies or "tidies" objects. A path written into a Terra
   attribute or a deposit is an issued pointer that someone already holds.
 - It never writes to Terra: no attribute edits and no entity or submission changes.
@@ -365,4 +424,5 @@ to fix a plan you did not read.
 - It never gives a review (LAST-COPY) list a wrapper.
 - It never touches `fc-secure-` buckets in `estate scan`. They are skipped.
 - It has no `--execute` flag, and v0.1 has no deleter option other than the `gcloud storage rm`
-  wrapper.
+  wrapper. `clean --confirm <plan_id>` is not an execute flag: its value has to be the
+  plan id, which you only get by reading the plan.

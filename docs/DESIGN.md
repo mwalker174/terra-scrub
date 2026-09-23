@@ -51,12 +51,14 @@ Keep public function names from the sources (`read_snapshot`, `api_get`, `human`
   `session.get` directly where a 404 is an expected answer (`plan.live_stat`,
   `verify`'s object and soft-deleted stats). Every call passes a timeout.
 - GET-only modules: `http`, `util`, `snapshot`, `terra`, `analyze`, `candidates`,
-  `plan`, `verify`. `tests/test_readonly_lint.py` parses their AST and fails on:
+  `plan`, `verify`, `runs`, `scan`, `status`. `tests/test_readonly_lint.py` parses their AST and fails on:
   any `.post/.put/.patch/.delete` call, `requests.<mutating verb>`, `os.remove/unlink/
   rmdir/rename-of-remote`, `shutil` import, `subprocess` import, any argparse flag
   matching `--execute|--apply|--delete|--rm|--force-delete`, and any `gsutil`/`gcloud`
   string outside the wrapper-template in `plan.py`.
-- Exempt (and why): `approve.py` writes ONE token into a local wrapper file;
+- Exempt (and why): `clean.py` is the ONE module that runs a delete: it arms and executes the
+  plan's wrapper only after a human types the plan id (see docs/SAFETY.md §7).
+  `approve.py` writes ONE token into a local wrapper file;
   `estate.py` shells out to `terra-scrub` itself (`[sys.executable, "-m", "terra_scrub", ...]`)
   for per-bucket isolation and logs. Neither touches GCS.
 - `verify.py` in clarum used `subprocess` to invoke the snapshot script for the
