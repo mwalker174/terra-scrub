@@ -19,7 +19,7 @@ for the module map.
 - **Keep the GET-only modules GET-only.** `tests/test_readonly_lint.py` fails on any mutating
   HTTP verb, `subprocess`/`shutil` import, `--execute`-style flag, or `gsutil`/`gcloud` string
   outside the wrapper template in `plan.py`. Do not weaken the lint to make a change pass.
-- **Guards G1–G9, plan gates and the ordering invariant are behaviour, not documentation.**
+- **Guards G1–G10, plan gates and the ordering invariant are behaviour, not documentation.**
   Changing one means changing its test and its `docs/SAFETY.md` section in the same change.
 - Hand-computed test expectations in `tests/conftest.py` are the contract. Do not re-derive
   them with the code under test.

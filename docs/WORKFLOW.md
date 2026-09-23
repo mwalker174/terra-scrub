@@ -19,7 +19,7 @@ terra-scrub scan my-ns/my-ws \
 ```
 
 It resolves the workspace's bucket and, into a new run directory, takes the snapshot,
-then the Terra context, builds the candidate lists (guards G1–G9), captures a fresh
+then the Terra context, builds the candidate lists (guards G1–G10), captures a fresh
 context, and runs `plan` against live GCS. It ends by printing the plan id, the
 object count and bytes, and the next command.
 
@@ -33,6 +33,10 @@ object count and bytes, and the next command.
   rows stay on the protected review list, which never gets a wrapper. Rows without an
   md5 are never promoted, and G8/G9 still apply. Use it only when the owner has
   decided it.
+- `--include-logs` also deletes Cromwell logs (`stdout`, `stderr`, `*.log`) under
+  Aborted/Failed submissions, last copies included (reason `LOG_FILE`, G10). Add
+  `--include-done-logs` for logs under Done submissions, and `--logs-older-than DAYS`
+  to keep recent ones. Return codes and scripts are always kept.
 
 **2. Status** (read-only):
 
@@ -179,7 +183,7 @@ terra-scrub stale  $R/inv/$K.jsonl --terra $R/inv/$K.terra.json --days 180
 terra-scrub dupes  $R/inv/$K.jsonl                              # md5 groups, cacheCopy
 ```
 
-**4. Candidates.** This step is offline. It applies guards G1–G9 and writes the
+**4. Candidates.** This step is offline. It applies guards G1–G10 and writes the
 delete list and the review list:
 
 ```bash

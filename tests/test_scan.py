@@ -179,12 +179,15 @@ def test_scan_prefix_passthrough_reaches_candidates_and_plan(monkeypatch, tmp_pa
     monkeypatch.setattr(plan, "main",
                         lambda argv=None: (seen.setdefault("plan", argv), rec_plan(argv))[1])
     res = run_cmd(scan, ["ns/ws", "--prefix", "submissions/cccc3333", "--include-zero-byte",
-                         "--aborted-last-copy-deletable", "--workers", "3"])
+                         "--aborted-last-copy-deletable", "--include-logs",
+                         "--include-done-logs", "--logs-older-than", "30", "--workers", "3"])
     assert res.returncode == 0, res.stderr + res.stdout
     c = seen["cand"]
     assert c[c.index("--max-snapshot-age") + 1] == "1"
     assert c[c.index("--prefix") + 1] == "submissions/cccc3333"
     assert "--include-zero-byte" in c and "--aborted-last-copy-deletable" in c
+    assert "--include-logs" in c and "--include-done-logs" in c
+    assert c[c.index("--logs-older-than") + 1] == "30"
     p = seen["plan"]
     assert p[p.index("--prefix") + 1] == "submissions/cccc3333/"
     assert p[p.index("--workers") + 1] == "3"

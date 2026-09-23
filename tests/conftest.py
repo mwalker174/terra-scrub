@@ -41,6 +41,11 @@ Hand-computed expectations:
       (d9b only under --include-zero-byte, G6)
   protected     = {d2a, d3, d10, d13}                        550 bytes
   G5 provenance kept (NEITHER list, by default) = {d8, p1..p9}
+  G10 --include-logs: LOG_FILE rows = {d8, p1, p2}             40 bytes
+      (the logs under Aborted cccc3333; p3..p8 are rc/scripts and stay under G5)
+      + --include-done-logs: also p9 (Done aaaa1111)           +8 bytes
+      --logs-older-than 120 (snapshot 2026-09-11): d8/p1/p2 are 133 days old,
+      p9 is 102 days old -> p9 drops out even with --include-done-logs
   G3-referenced (neither)   = {d6}
   in-flight never listed    = {d4b}
   dupes redundant-bytes (md5, (n-1)*size) = 2*100 + 200 + 400 + 500 + 0 + 70 = 1370
@@ -108,6 +113,12 @@ EXPECTED_PROTECTED_BYTES = 550
 EXPECTED_PROVENANCE = {"d8", "p1", "p2", "p3", "p4", "p5", "p6", "p7", "p8", "p9"}
 # with --include-provenance, the ones under a DEAD sub come back as last copies
 PROVENANCE_REVIVE = {"d8", "p1", "p2", "p3", "p4", "p5", "p6", "p7", "p8"}
+# G10: --include-logs lists the logs under the Aborted sub (d8 .log, p1 stdout,
+# p2 stderr); --include-done-logs adds p9 (.log under Done aaaa1111).
+EXPECTED_LOGS_DEAD = {"d8", "p1", "p2"}
+EXPECTED_LOGS_DEAD_BYTES = 40
+EXPECTED_LOGS_DONE = {"p9"}
+EXPECTED_LOGS_DONE_BYTES = 8
 EXPECTED_NEITHER = {"d6"}          # G3-referenced
 NEVER_CANDIDATES = {"d4b", "d5", "d11", "d1b", "d4a", "d7a", "d9a", "d12a"}
 

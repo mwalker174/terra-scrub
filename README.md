@@ -109,9 +109,9 @@ estate. [docs/WORKFLOW.md](docs/WORKFLOW.md) covers both.
 - **Ordering is enforced.** The bucket listing has to be captured before the Terra
   context. A plan needs a context captured after its manifest was generated. Both
   rules are refusals in the code, and `scan` runs the steps in that order.
-- **Guards G1–G9** keep deliverables, last copies, Cromwell provenance, zero-byte
+- **Guards G1–G10** keep deliverables, last copies, Cromwell provenance, zero-byte
   markers, index/data pairs and anything named in a reference list off the delete
-  list.
+  list. Cromwell logs go only with `--include-logs`, scoped by G10.
 - **Two-man rule.** `plan` writes a wrapper that refuses to run. It is armed only when
   a person types the plan id, at `clean`'s prompt or to `approve`. The wrapper
   re-checks its URI list's sha256 before deleting. This repo's
@@ -124,6 +124,42 @@ estate. [docs/WORKFLOW.md](docs/WORKFLOW.md) covers both.
   survive, and that soft-deleted copies exist.
 
 [docs/SAFETY.md](docs/SAFETY.md) gives the reasoning behind each rule.
+
+## How this differs from FISS `mop` / Automop
+
+[FISS `mop`](https://github.com/broadinstitute/fiss/blob/master/firecloud/fiss.py)
+lists the bucket and takes every object under one of the workspace's submission
+directories (`<id>/...` or `submissions/<id>/...`). It keeps anything referenced by a
+workspace or entity attribute, and Cromwell's execution records (logs, rc files,
+scripts). It pipes the rest to `gsutil -m rm -I`.
+[Automop](https://github.com/talkowski-lab/lr-pipeline/blob/main/wdl/tools/Automop.wdl)
+runs `fissfc --yes mop` unattended as a Terra workflow and records the bytes freed in
+BigQuery. terra-scrub asks a narrower question: which objects are provably redundant,
+or come from a dead run?
+
+| | `mop` / Automop | terra-scrub |
+|---|---|---|
+| Scope | any object under a submission id of this workspace | `--prefix` (default `submissions/`) |
+| Unreferenced outputs of a **Done** submission | deleted, even the only copy | kept unless a byte-identical copy survives (EXACT_DUPLICATE) |
+| Outputs of **Aborted/Failed** submissions | deleted if unreferenced | deleted if unreferenced; last copies go to a review list unless the owner opts in (`--aborted-last-copy-deletable`) |
+| **In-flight** submissions | status never checked, so a running workflow's intermediates are candidates | never touched (G1) |
+| Content identity | none: path and reference only | md5, from the listing and again live at plan time |
+| References checked | this workspace's attributes | the union of every `--terra` context that can see the bucket (G3) |
+| Pointers inside files (sample maps, gVCF lists) | not seen | `--reference-list` protects them (G8/G9) |
+| Sidecars, zero-byte markers | no special handling | sidecars stay with their data (G7); zero-byte objects kept (G6) |
+| Cromwell logs, rc files, scripts | always kept | kept; logs can go with `--include-logs` (G10), rc files and scripts always kept |
+| Filters | `--include`/`--exclude` basename globs, `--submission-ids` | `--prefix`, owner-policy flags |
+| Read order | workspace attributes read before the listing, entities after | listing strictly before every Terra read, and a fresh context after the manifest before planning |
+| Between listing and delete | nothing: deletes straight from the listing | `plan` re-stats every object live; size, md5 or new-reference drift blocks the row |
+| Who deletes | the tool, after a prompt (Automop passes `--yes`) | only a person typing the plan id; AI assistants are denied |
+| Failure reporting | `gsutil`'s exit status is ignored and `mop` returns 0 (Automop greps the log instead) | the wrapper stops at the first failure and `clean` reports it |
+| Afterwards | freed-bytes total | `verify` re-lists the bucket and checks keepers and soft-deleted copies |
+
+Net effect: `mop` reclaims more, because the unreferenced unique outputs of
+successful runs are usually the bulk of a bucket. Deleting those is a judgement about
+whether they can be regenerated, and terra-scrub leaves that call to a person. Use
+`mop` when "unreferenced means disposable" holds for the workspace and nothing is
+running in it. Use terra-scrub when it doesn't, or when a delete needs an audit trail.
 
 ## Development
 

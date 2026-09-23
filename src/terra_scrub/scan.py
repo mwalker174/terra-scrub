@@ -8,7 +8,7 @@ For each target, scan runs the whole read-only half of the workflow, in this ord
   2. snapshot  list every object in the bucket              -> inv/<key>.jsonl
   3. context   capture Terra attributes, references and submissions, AFTER the
                listing                                      -> inv/<key>.terra.json
-  4. candidates apply guards G1-G9 offline and write the delete list and the
+  4. candidates apply guards G1-G10 offline and write the delete list and the
                last-copy review list                        -> cleanup/<key>/<bucket>.cleanup*.tsv
   5. plan-time context: a FRESH context captured after the delete list's
                generated= stamp                             -> inv/<key>.plan-time.terra.json
@@ -133,9 +133,11 @@ def candidate_argv(r, args):
     for p in args.prefix or []:
         argv += ["--prefix", p]
     for flag in ("aborted_last_copy_deletable", "include_provenance", "include_zero_byte",
-                 "allow_index_split"):
+                 "allow_index_split", "include_logs", "include_done_logs"):
         if getattr(args, flag):
             argv.append("--" + flag.replace("_", "-"))
+    if args.logs_older_than:
+        argv += ["--logs-older-than", f"{args.logs_older_than:g}"]
     return argv
 
 
@@ -175,7 +177,7 @@ def scan_one(ns, ws, args, say):
         _captured(step, r.log(step), terra.capture_context, ns, ws, r.context, session=sess)
         r.write_meta(step="candidates")
 
-        # 3. candidates (offline, guards G1-G9)
+        # 3. candidates (offline, guards G1-G10)
         step = "candidates"
         say(f"{ns}/{ws}: building candidate lists")
         _captured(step, r.log(step), candidates.main, candidate_argv(r, args))
@@ -335,6 +337,13 @@ def add_arguments(ap: argparse.ArgumentParser) -> None:
                    help="list zero-byte objects too (G6 off)")
     g.add_argument("--allow-index-split", action="store_true",
                    help="allow deleting a sidecar whose data survives (G7 off)")
+    g.add_argument("--include-logs", action="store_true",
+                   help="delete Cromwell logs (stdout/stderr/*.log) under Aborted/Failed "
+                        "submissions, last copies included (G10); rc files stay")
+    g.add_argument("--include-done-logs", action="store_true",
+                   help="with --include-logs: logs under Done submissions too")
+    g.add_argument("--logs-older-than", type=float, default=0.0, metavar="DAYS",
+                   help="with --include-logs: only logs older than DAYS")
     ap.add_argument("--workers", type=int, default=10,
                     help="parallel live stats during planning (default 10)")
     ap.add_argument("--page-size", type=int, default=1000,

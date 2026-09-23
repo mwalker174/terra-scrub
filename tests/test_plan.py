@@ -79,6 +79,19 @@ def test_apply_clean_plan(tmp_path, run_plan_with_stub):
         f"the shipped wrapper refuses to delete when run (rc={rr.returncode})"
 
 
+
+def test_apply_log_rows(tmp_path, run_plan_with_stub):
+    """G10 rows go through the same live gate: md5-bearing logs are planned, the
+    md5-less d8 is SKIP_NO_DIGEST (no digest, no plan -- logs get no exception)."""
+    tsv, fresh = make_plan_inputs(tmp_path / "plan-logs", gen_args=("--include-logs",))
+    r = run_plan_with_stub("--manifest", tsv, "--terra", fresh, "--workers", "4")
+    assert r.returncode == 0, r.stderr[-300:]
+    p = _load(tsv + ".plan.json")
+    assert p["objects_by_status"].get("SKIP_NO_DIGEST") == 1
+    uris = {u[len(f"gs://{BUCKET}/"):] for u in _lines(tsv + ".plan.uris.txt")}
+    assert uris == {NAMES[k] for k in EXPECTED_DELETE} | {NAMES["p1"], NAMES["p2"]}
+    assert p["plan_bytes"] == EXPECTED_DELETE_BYTES + 15 + 5 and p["executable"] is True
+
 def test_apply_verdicts(tmp_path, run_plan_with_stub, live):
     # A pointer created AFTER the capture is the bug class a stale list cannot see.
     subs2 = copy.deepcopy(SUBS)
