@@ -131,6 +131,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 from collections import Counter, defaultdict
@@ -172,6 +173,24 @@ def is_log(name):
     """True for Cromwell log files: `stdout`, `stderr`, anything ending `.log`."""
     base = name.rsplit("/", 1)[-1]
     return base.endswith(".log") or base in LOG_NAMES
+
+
+MAX_LOG_AGE_DAYS = 36500    # 100 years: older than any GCS object, and far inside timedelta
+
+
+def log_age_days(text):
+    """argparse type for --logs-older-than. float() accepts 'nan' and 'inf', and a
+    huge value overflows the snapshot-minus-age cutoff, so all three are refused
+    at parse time -- before `scan` has listed anything."""
+    try:
+        v = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"REFUSING: not a number: {text!r}") from None
+    if not math.isfinite(v) or not 0 <= v <= MAX_LOG_AGE_DAYS:
+        raise argparse.ArgumentTypeError(
+            f"REFUSING: must be a finite number of days in [0, {MAX_LOG_AGE_DAYS}] "
+            f"(got {text!r})")
+    return v
 
 
 # G7: companion files. A sidecar is useless without its data and, more to the point,
@@ -361,7 +380,7 @@ def add_arguments(ap: argparse.ArgumentParser) -> None:
                          "and scripts stay under G5")
     ap.add_argument("--include-done-logs", action="store_true",
                     help="with --include-logs: also list logs under Done submissions")
-    ap.add_argument("--logs-older-than", type=float, default=0.0, metavar="DAYS",
+    ap.add_argument("--logs-older-than", type=log_age_days, default=0.0, metavar="DAYS",
                     help="with --include-logs: only logs last updated more than DAYS "
                          "days before the snapshot (default 0 = any age)")
     ap.add_argument("--force", action="store_true",
@@ -372,8 +391,6 @@ def run(args: argparse.Namespace) -> int:
     if (args.include_done_logs or args.logs_older_than) and not args.include_logs:
         sys.exit("REFUSING: --include-done-logs / --logs-older-than only narrow or "
                  "widen --include-logs; pass --include-logs too")
-    if args.logs_older_than < 0:
-        sys.exit(f"REFUSING: --logs-older-than must be >= 0 (got {args.logs_older_than:g})")
     # prefix normalization: trailing slash so 'submissions/cccc3333' cannot
     # match sibling 'submissions/cccc3333X/'; '' keeps match-everything but is
     # called out loudly below

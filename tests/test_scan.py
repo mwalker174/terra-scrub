@@ -193,6 +193,14 @@ def test_scan_prefix_passthrough_reaches_candidates_and_plan(monkeypatch, tmp_pa
     assert p[p.index("--workers") + 1] == "3"
 
 
+
+@pytest.mark.parametrize("bad", ["nan", "inf", "-1", "1e9"])
+def test_scan_refuses_bad_log_age_before_listing(monkeypatch, tmp_path, bad):
+    calls = install_fakes(monkeypatch, tmp_path)
+    res = run_cmd(scan, ["ns/ws", "--include-logs", "--logs-older-than", bad])
+    assert res.returncode != 0 and "REFUSING" in res.stderr, res.stderr
+    assert calls == [], "refused at parse time: nothing resolved, listed or read"
+
 def test_plan_prefix():
     assert scan.plan_prefix(None) is None
     assert scan.plan_prefix(["submissions/a"]) == "submissions/a/"

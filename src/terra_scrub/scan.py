@@ -342,7 +342,8 @@ def add_arguments(ap: argparse.ArgumentParser) -> None:
                         "submissions, last copies included (G10); rc files stay")
     g.add_argument("--include-done-logs", action="store_true",
                    help="with --include-logs: logs under Done submissions too")
-    g.add_argument("--logs-older-than", type=float, default=0.0, metavar="DAYS",
+    g.add_argument("--logs-older-than", type=candidates.log_age_days, default=0.0,
+                   metavar="DAYS",
                    help="with --include-logs: only logs older than DAYS")
     ap.add_argument("--workers", type=int, default=10,
                     help="parallel live stats during planning (default 10)")

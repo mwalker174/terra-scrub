@@ -262,7 +262,11 @@ def test_logs(tmp_path):
     assert set(_lists(out4)[0]) == base_del, "no log is 140 days old"
 
     for bad in (["--include-done-logs"], ["--logs-older-than", "30"],
-                ["--include-logs", "--logs-older-than", "-1"]):
+                ["--include-logs", "--logs-older-than", "-1"],
+                ["--include-logs", "--logs-older-than", "nan"],
+                ["--include-logs", "--logs-older-than", "inf"],
+                ["--include-logs", "--logs-older-than", "1e9"],
+                ["--include-logs", "--logs-older-than", "soon"]):
         rb = cand("--snapshot", snap, "--terra", terra, "--out-dir", str(d / "bad"), *bad)
         assert rb.returncode != 0 and "REFUSING" in rb.stderr, f"{bad} is refused"
         assert not os.path.exists(str(d / "bad")), "a refusal writes nothing"
