@@ -116,11 +116,17 @@ the lowest rank. Ties go to the newest `updated` time, then to the name.
 | 5 | under a dead submission, cacheCopy |
 
 So a deliverable outside `submissions/` always wins, and a copy from a successful run
-beats a call-cache copy or a copy from a dead run.
+beats a call-cache copy or a copy from a dead run. A copy that the LOG_FILE rule is
+deleting never wins while any other copy of that md5 exists.
+
+**LOG_FILE** (opt-in, `--include-logs`). Cromwell log files (`stdout`, `stderr`,
+anything ending `.log`) under Aborted/Failed submissions, and under Done submissions
+too with `--include-done-logs`. They are listed whether or not another copy exists.
+See G10.
 
 ---
 
-## 4. Guards G1–G9
+## 4. Guards G1–G10
 
 All guards are checked before any output is written. If any check fails, the run
 aborts.
@@ -157,7 +163,7 @@ and anything ending in `.log` or `-rc.txt` are kept off both lists. They are a t
 share of a typical bucket, and they are the only record of what each shard actually
 ran. The per-call return codes are how you diagnose a failed pipeline weeks later. FISS
 `mop`'s `can_delete()` has always kept these files too. Opt out with
-`--include-provenance`.
+`--include-provenance`, or take only the logs with `--include-logs` (G10).
 
 **G6: zero-byte objects stay.** Deleting them frees nothing. They also all share the
 empty-file md5, which breaks the duplicate rule: `x.gc_bias.pdf` would get deleted
@@ -197,6 +203,22 @@ in your write-up.
 `--aborted-last-copy-deletable` is an **owner policy** you opt into per run. It moves
 LAST_COPY rows under Aborted/Failed submissions to the delete list with reason
 `ABORTED_LAST_COPY`. Rows without an md5 are never promoted, and G8/G9 still apply.
+
+**G10: log cleanup is fenced.** `--include-logs` lists Cromwell log files (`stdout`,
+`stderr`, `*.log`) for deletion with reason `LOG_FILE`. It is the one rule that
+deletes a last copy without a review list, so it is checked to take exactly what was
+asked for: every LOG_FILE row is a log under the candidate prefix, under an
+Aborted/Failed submission (Done too only with `--include-done-logs`), last updated
+more than `--logs-older-than DAYS` before the snapshot when that is set, and no
+LOG_FILE row exists without `--include-logs`. Return codes (`rc`, `memory_retry_rc`,
+`-rc.txt`), `output` and the scripts stay under G5 either way. G3, G6 and G8 still
+apply to logs. G2 judges each md5 group without its LOG_FILE rows, so a group made
+only of logs may go whole, and a log is never an md5 group's kept copy while another
+copy exists. `plan` gives logs no exception: a log without an md5 is `SKIP_NO_DIGEST`.
+*Why:* logs are what a person reads once, if ever, and on a bucket with many shards
+they add up. The return codes and scripts are what diagnosing a failure actually
+needs, which is why they are not in scope. Done-submission logs default to kept
+because a successful run's logs are the record of how a delivered output was made.
 
 ---
 

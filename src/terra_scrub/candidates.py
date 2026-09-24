@@ -35,6 +35,15 @@ Rules (a file may match both; reasons are unioned):
         3  under an in-flight/unknown submission
         4  under a dead (Aborted/Failed) submission, non-cacheCopy
         5  under a dead submission, cacheCopy
+      A copy that the LOG_FILE rule is deleting never wins while any other
+      copy of that md5 exists.
+  LOG_FILE (opt-in: --include-logs)
+      Cromwell log files (`stdout`, `stderr`, anything ending `.log`) under an
+      Aborted/Failed submission -- and under a Done one too with
+      --include-done-logs -- deleted whether or not another copy exists.
+      --logs-older-than N limits it to logs last updated more than N days
+      before the snapshot. Return codes and scripts stay under G5 regardless.
+      (docs/SAFETY.md § G10)
 
 Safety guards (asserted before any output is written; the run aborts if any
 fails). Rationale for each lives in docs/SAFETY.md § G<n>:
@@ -90,6 +99,13 @@ fails). Rationale for each lives in docs/SAFETY.md § G<n>:
       not its sample is named in a reference list. Name matching alone is not
       enough, because a callset name is not a sample name: last-copy shards of a
       delivered callset match no reference list. (docs/SAFETY.md § G9)
+  G10 LOG_FILE is the ONE rule that deletes a last copy without a review list, so
+      it is fenced to exactly what was asked for: every LOG_FILE row is a log
+      (`stdout`/`stderr`/`*.log`, never `rc`/`-rc.txt`/scripts), under the
+      candidate prefix, under an Aborted/Failed submission (Done only with
+      --include-done-logs), older than --logs-older-than, and no LOG_FILE row
+      exists at all without --include-logs. G3/G6/G8 still apply to logs.
+      (docs/SAFETY.md § G10)
 
 Other operator protections:
   - refuses to overwrite existing output files unless --force is given
@@ -115,10 +131,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 from collections import Counter, defaultdict
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from terra_scrub.snapshot import read_snapshot
 from terra_scrub.util import human, parse_ts, tsv_escape
@@ -144,6 +161,36 @@ def is_provenance(name):
     if base.endswith(".log") or base.endswith("-rc.txt"):
         return True
     return base in PROVENANCE_NAMES
+
+
+# G10: the subset of G5 that --include-logs may remove. Logs record what a shard
+# printed; the return codes and the scripts record what it ran and how it ended,
+# which is what diagnosing a failure needs, so those stay under G5 unconditionally.
+LOG_NAMES = {"stdout", "stderr"}
+
+
+def is_log(name):
+    """True for Cromwell log files: `stdout`, `stderr`, anything ending `.log`."""
+    base = name.rsplit("/", 1)[-1]
+    return base.endswith(".log") or base in LOG_NAMES
+
+
+MAX_LOG_AGE_DAYS = 36500    # 100 years: older than any GCS object, and far inside timedelta
+
+
+def log_age_days(text):
+    """argparse type for --logs-older-than. float() accepts 'nan' and 'inf', and a
+    huge value overflows the snapshot-minus-age cutoff, so all three are refused
+    at parse time -- before `scan` has listed anything."""
+    try:
+        v = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"REFUSING: not a number: {text!r}") from None
+    if not math.isfinite(v) or not 0 <= v <= MAX_LOG_AGE_DAYS:
+        raise argparse.ArgumentTypeError(
+            f"REFUSING: must be a finite number of days in [0, {MAX_LOG_AGE_DAYS}] "
+            f"(got {text!r})")
+    return v
 
 
 # G7: companion files. A sidecar is useless without its data and, more to the point,
@@ -326,11 +373,24 @@ def add_arguments(ap: argparse.ArgumentParser) -> None:
                          "md5 are never promoted, and --reference-list carve-outs "
                          "(G8/G9) still apply. Without this flag the review list is "
                          "unchanged")
+    ap.add_argument("--include-logs", action="store_true",
+                    help="list Cromwell logs (stdout, stderr, *.log) under "
+                         "Aborted/Failed submissions for deletion with reason "
+                         "LOG_FILE, even when they are the only copy (G10). rc files "
+                         "and scripts stay under G5")
+    ap.add_argument("--include-done-logs", action="store_true",
+                    help="with --include-logs: also list logs under Done submissions")
+    ap.add_argument("--logs-older-than", type=log_age_days, default=0.0, metavar="DAYS",
+                    help="with --include-logs: only logs last updated more than DAYS "
+                         "days before the snapshot (default 0 = any age)")
     ap.add_argument("--force", action="store_true",
                     help="overwrite existing output files in --out-dir")
 
 
 def run(args: argparse.Namespace) -> int:
+    if (args.include_done_logs or args.logs_older_than) and not args.include_logs:
+        sys.exit("REFUSING: --include-done-logs / --logs-older-than only narrow or "
+                 "widen --include-logs; pass --include-logs too")
     # prefix normalization: trailing slash so 'submissions/cccc3333' cannot
     # match sibling 'submissions/cccc3333X/'; '' keeps match-everything but is
     # called out loudly below
@@ -438,9 +498,29 @@ def run(args: argparse.Namespace) -> int:
     def eligible(o):
         return any(o["name"].startswith(p) for p in prefixes)
 
+
     def sub_id(o):
         parts = o["name"].split("/")
         return parts[1] if parts[0] == "submissions" and len(parts) > 1 else None
+
+    # ---- G10: which logs the LOG_FILE rule may take --------------------------
+    log_statuses = (DEAD | DONE) if args.include_done_logs else DEAD
+    if args.logs_older_than and snap_utc is None:
+        sys.exit("REFUSING: --logs-older-than needs the snapshot's snapshot_utc to "
+                 "measure age from, and this snapshot has none; re-capture it")
+    log_cutoff = (snap_utc - timedelta(days=args.logs_older_than)
+                  if args.logs_older_than else None)
+
+    def log_old_enough(o):
+        if log_cutoff is None:
+            return True
+        upd = parse_ts(o.get("updated"))
+        return upd is not None and upd < log_cutoff   # unparseable -> too young
+
+    log_names = {o["name"] for o in objs
+                 if args.include_logs and is_log(o["name"]) and eligible(o)
+                 and sub_status_of(subs, sub_id(o)) in log_statuses
+                 and log_old_enough(o)}
 
     # ---- group by md5 (rule 2) --------------------------------------------
     by_md5 = defaultdict(list)
@@ -456,8 +536,11 @@ def run(args: argparse.Namespace) -> int:
     keep_by_md5 = {}     # md5 -> name of the canonical kept copy
 
     def keyfn(o):
-        # newest first within rank: sort by rank asc, updated desc, name asc
-        return (keep_rank(o["name"], prefixes, subs), -_upd_ts(o), o["name"])
+        # newest first within rank: sort by rank asc, updated desc, name asc.
+        # A log the LOG_FILE rule is deleting never keeps a group while any other
+        # copy exists: an EXACT_DUPLICATE row must never name a doomed kept copy.
+        return (o["name"] in log_names, keep_rank(o["name"], prefixes, subs),
+                -_upd_ts(o), o["name"])
 
     for md5, group in by_md5.items():
         if len(group) < 2:
@@ -487,15 +570,18 @@ def run(args: argparse.Namespace) -> int:
     # file is NOT itself a candidate -- a pair that dies together is fine.
     by_name = {o["name"] for o in objs}
     cand_names = {o["name"] for o in objs
-                  if (args.include_provenance or not is_provenance(o["name"]))
+                  if (args.include_provenance or not is_provenance(o["name"])
+                      or o["name"] in log_names)
                   and (args.include_zero_byte or o["size"] != 0)
                   and eligible(o)
-                  and (sub_status_of(subs, sub_id(o)) in DEAD
+                  and (o["name"] in log_names
+                       or sub_status_of(subs, sub_id(o)) in DEAD
                        or (sub_status_of(subs, sub_id(o)) in DONE
                            and o["name"] in dup_of))}
     prov_bytes = 0
     for o in objs:
-        if not args.include_provenance and is_provenance(o["name"]):
+        is_log_row = o["name"] in log_names
+        if not args.include_provenance and is_provenance(o["name"]) and not is_log_row:
             n_provenance_kept += 1
             prov_bytes += o["size"]
             continue    # G5: execution provenance, not a candidate on either list
@@ -514,7 +600,9 @@ def run(args: argparse.Namespace) -> int:
         st = sub_status_of(subs, sid)
         reasons = []
         detail = {}
-        if eligible(o):
+        if is_log_row:
+            reasons.append("LOG_FILE")    # G10: no dup/aborted evidence needed
+        elif eligible(o):
             if st in DEAD:
                 reasons.append("ABORTED_SUBMISSION")
             elif st not in DONE:
@@ -544,7 +632,7 @@ def run(args: argparse.Namespace) -> int:
                              for x in g)
         detail["duplicate"] = ({"kept": dup_of[o["name"]],
                                 "n_copies": n_copies.get(o["name"])}
-                               if o["name"] in dup_of else None)
+                               if o["name"] in dup_of and not is_log_row else None)
         detail["superseded"] = superseded
         cand[o["name"]] = {
             "name": o["name"], "size": o["size"], "md5": o.get("md5Hash"),
@@ -568,6 +656,8 @@ def run(args: argparse.Namespace) -> int:
             keep_name = keep_by_md5.get(md5)
         if keep_name not in cand:
             continue  # the survivor wasn't being deleted anyway
+        if keep_name in log_names:
+            continue  # every copy is a log the LOG_FILE rule takes (G10)
         rec = cand.pop(keep_name)
         rec["reasons"] = ["LAST_COPY_PROTECTED"] + [r for r in rec["reasons"]
                                                     if r != "EXACT_DUPLICATE"]
@@ -584,7 +674,8 @@ def run(args: argparse.Namespace) -> int:
     # NOT re-enlarge the delete list — G1/G3 already excluded in-flight and
     # referenced objects before we got here.
     for name, rec in list(cand.items()):
-        if rec["submission_status"] in DEAD and not rec.get("md5"):
+        if (rec["submission_status"] in DEAD and not rec.get("md5")
+                and rec["reasons"] != ["LOG_FILE"]):
             rec = cand.pop(name)
             rec["reasons"] = ["NO_MD5_PROTECTED"] + rec["reasons"]
             rec["note"] = ("no md5Hash on this object — cannot verify whether a "
@@ -640,9 +731,11 @@ def run(args: argparse.Namespace) -> int:
 
     # ---- safety guards ------------------------------------------------------
     checks = []
+    log_rows = {n for n, r in cand.items() if r["reasons"] == ["LOG_FILE"]}
     g1 = all(
         any(r["name"].startswith(p) for p in prefixes) and
-        ((r["submission_status"] in DEAD) if "ABORTED_SUBMISSION" in r["reasons"]
+        ((r["submission_status"] in log_statuses) if r["name"] in log_rows
+         else (r["submission_status"] in DEAD) if "ABORTED_SUBMISSION" in r["reasons"]
          else r["submission_status"] in DONE)
         for r in cand.values())
     checks.append(("G1 prefixes + terminal status only", g1))
@@ -652,9 +745,15 @@ def run(args: argparse.Namespace) -> int:
     # group whose every copy lives under an aborted/failed submission. The
     # exception is scoped to exactly that -- a group with any Done or in-flight
     # copy must still keep one, so the guard keeps its teeth and a policy run
-    # cannot quietly wipe live content (docs/SAFETY.md § G2).
+    # cannot quietly wipe live content (docs/SAFETY.md § G2). LOG_FILE rows are
+    # G10's business, not G2's: they are left out of the group before it is judged,
+    # and a group made only of them passes (docs/SAFETY.md § G10).
+    def non_log(g):
+        return [o for o in g if o["name"] not in log_rows]
+
     def g2_ok(g):
-        if sum(1 for o in g if o["name"] not in cand) >= 1:
+        g = non_log(g)
+        if not g or sum(1 for o in g if o["name"] not in cand) >= 1:
             return True
         if not args.aborted_last_copy_deletable:
             return False
@@ -663,7 +762,7 @@ def run(args: argparse.Namespace) -> int:
     checks.append(("G2 every md5 group keeps >=1 copy"
                    + (" (except all-aborted groups, per policy)"
                       if args.aborted_last_copy_deletable else ""), g2))
-    g2b = all(all(sub_status_of(subs, sub_id(o)) in DEAD for o in g)
+    g2b = all(all(sub_status_of(subs, sub_id(o)) in DEAD for o in non_log(g))
               for md5, g in by_md5.items() if len(g) >= 2
               and sum(1 for o in g if o["name"] not in cand) == 0)
     checks.append(("G2b a fully-deleted md5 group is all-aborted", g2b))
@@ -676,6 +775,12 @@ def run(args: argparse.Namespace) -> int:
     g4 = all(r["md5"] for r in cand.values()
              if "EXACT_DUPLICATE" in r["reasons"])
     checks.append(("G4 duplicate rule only uses md5", g4))
+    g10 = all(args.include_logs and is_log(n) and eligible(cand[n])
+              and cand[n]["submission_status"] in log_statuses
+              and log_old_enough(cand[n])
+              for n in log_rows) and \
+        not any("LOG_FILE" in r["reasons"] for n, r in cand.items() if n not in log_rows)
+    checks.append(("G10 LOG_FILE rows are logs within --include-logs scope", g10))
     bad = [n for n, ok in checks if not ok]
     empty_note = (f" [EMPTY: {len(cand) + len(protected)} candidates — check --prefix "
                   f"and inputs before trusting this output]"
@@ -686,6 +791,9 @@ def run(args: argparse.Namespace) -> int:
         sys.exit(1)
 
     # ---- write outputs ------------------------------------------------------
+    log_mode = ("kept" if not args.include_logs else
+                ("dead+done" if args.include_done_logs else "dead")
+                + (f",older_than={args.logs_older_than:g}d" if args.logs_older_than else ""))
     out_dir = args.out_dir or os.path.dirname(os.path.abspath(args.snapshot))
     os.makedirs(out_dir, exist_ok=True)
     tsv = os.path.join(out_dir, f"{bucket}.cleanup.tsv")
@@ -723,6 +831,7 @@ def run(args: argparse.Namespace) -> int:
                 f"bucket={bucket} snapshot={meta.get('snapshot_utc')} "
                 f"provenance_keep={'off' if args.include_provenance else 'on'} "
                 f"aborted_last_copy={'deletable' if args.aborted_last_copy_deletable else 'protected'} "
+                f"logs={log_mode} "
                 f"generated={datetime.now(UTC).isoformat()}\n")
         f.write("# name\tsize_bytes\treasons\tsub_id\tsub_status\tsub_date\tconfig"
                 "\tkept_copy\tn_copies\tsuperseded_outside_sub\tmd5\n")
@@ -789,6 +898,11 @@ def run(args: argparse.Namespace) -> int:
               f"rows under aborted submissions PROMOTED to the delete list "
               f"(reason ABORTED_LAST_COPY); {n_deliverable_kept:,} held back by G9 "
               f"(sample named in a reference list)")
+    if args.include_logs:
+        log_bytes = sum(cand[n]["size"] for n in log_rows)
+        print(f"   LOG CLEANUP logs={log_mode}: {len(log_rows):,} log files listed for "
+              f"deletion (reason LOG_FILE, last copies included -- G10), "
+              f"{human(log_bytes)}; rc files and scripts still kept (G5)")
     print(f"   PROTECTED review list (NOT deletable by default): "
           f"{len(prows):,} objs, {human(prot_bytes)}"
           + (f"  (incl. {n_nomd5_protected} with no md5 — uniqueness unverifiable)"

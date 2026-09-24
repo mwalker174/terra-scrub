@@ -1,4 +1,4 @@
-"""candidates: the offline delete-list / protected-list generator (guards G1-G9)."""
+"""candidates: the offline delete-list / protected-list generator (guards G1-G10)."""
 import json
 import os
 
@@ -6,6 +6,10 @@ from conftest import (
     BUCKET,
     EXPECTED_DELETE,
     EXPECTED_DELETE_BYTES,
+    EXPECTED_LOGS_DEAD,
+    EXPECTED_LOGS_DEAD_BYTES,
+    EXPECTED_LOGS_DONE,
+    EXPECTED_LOGS_DONE_BYTES,
     EXPECTED_NEITHER,
     EXPECTED_PROTECTED,
     EXPECTED_PROTECTED_BYTES,
@@ -45,9 +49,9 @@ def test_cleanup(tmp_path):
     outdir = str(tmp_path / "clean-out")
     r = cand("--snapshot", snap, "--terra", terra, "--out-dir", outdir)
     assert r.returncode == 0, f"exit 0 (got {r.returncode}) {r.stdout[-400:]} {r.stderr[-400:]}"
-    # 6 checks: G2b and G7 re-asserted after the last-copy/policy moves. The count
-    # stays pinned -- a drift here is deleted-assertion detection.
-    assert "safety checks: PASS (6/6)" in r.stdout, "all 6 safety checks pass"
+    # 7 checks: G2b and G7 re-asserted after the last-copy/policy moves, plus G10.
+    # The count stays pinned -- a drift here is deleted-assertion detection.
+    assert "safety checks: PASS (7/7)" in r.stdout, "all 7 safety checks pass"
     base = f"{BUCKET}.cleanup"
     tsv = os.path.join(outdir, base + ".tsv")
     pjson = os.path.join(outdir, base + ".jsonl")
@@ -192,6 +196,110 @@ def test_provenance(tmp_path):
         "the flag only ADDS provenance rows; it never drops or rewrites a decision"
     assert NAMES["d6"] not in both1 and NAMES["d6"] not in both2, "G3 holds in both modes"
     assert NAMES["d4b"] not in both1 and NAMES["d4b"] not in both2, "in-flight holds in both modes"
+
+
+def _lists(outdir):
+    return (jsonl_rows(os.path.join(outdir, f"{BUCKET}.cleanup.jsonl")),
+            jsonl_rows(os.path.join(outdir, f"{BUCKET}.cleanup.protected.jsonl")))
+
+
+def test_logs(tmp_path):
+    """G10: --include-logs lists dead-sub logs as LOG_FILE; Done logs only on request."""
+    d = tmp_path / "logs"
+    snap, terra = write_fixtures(d)
+    dead = {NAMES[k] for k in EXPECTED_LOGS_DEAD}
+    done = {NAMES[k] for k in EXPECTED_LOGS_DONE}
+    base_del = {NAMES[k] for k in EXPECTED_DELETE}
+    base_prot = {NAMES[k] for k in EXPECTED_PROTECTED}
+
+    out0 = str(d / "default")
+    r0 = cand("--snapshot", snap, "--terra", terra, "--out-dir", out0)
+    assert r0.returncode == 0
+    assert " logs=kept " in first_line(os.path.join(out0, f"{BUCKET}.cleanup.tsv")), \
+        "default header records logs=kept"
+
+    out1 = str(d / "dead")
+    r1 = cand("--snapshot", snap, "--terra", terra, "--out-dir", out1, "--include-logs")
+    assert r1.returncode == 0, r1.stderr[-300:]
+    assert "safety checks: PASS (7/7)" in r1.stdout
+    dl, pl = _lists(out1)
+    assert set(dl) == base_del | dead, f"delete list = base + dead-sub logs (got {sorted(set(dl) ^ (base_del | dead))})"
+    assert set(pl) == base_prot, "review list unchanged: logs never land on it"
+    assert all(dl[n]["reasons"] == ["LOG_FILE"] for n in dead), "log rows carry LOG_FILE only"
+    assert sum(dl[n]["size"] for n in dead) == EXPECTED_LOGS_DEAD_BYTES
+    assert NAMES["d8"] in dl, "a log with no md5 is still listed (plan skips it as SKIP_NO_DIGEST)"
+    for k in ("p3", "p4", "p5", "p6", "p7", "p8"):
+        assert NAMES[k] not in dl and NAMES[k] not in pl, f"{k}: rc/scripts stay under G5"
+    assert not (done & (set(dl) | set(pl))), "Done-sub logs need --include-done-logs"
+    assert " logs=dead " in first_line(os.path.join(out1, f"{BUCKET}.cleanup.tsv"))
+    assert "LOG CLEANUP logs=dead: 3 log files" in r1.stdout
+
+    out2 = str(d / "done")
+    r2 = cand("--snapshot", snap, "--terra", terra, "--out-dir", out2,
+              "--include-logs", "--include-done-logs")
+    assert r2.returncode == 0, r2.stderr[-300:]
+    dl2, pl2 = _lists(out2)
+    assert set(dl2) == base_del | dead | done
+    assert set(pl2) == base_prot
+    assert dl2[NAMES["p9"]]["reasons"] == ["LOG_FILE"] \
+        and dl2[NAMES["p9"]]["submission_status"] == "Done"
+    assert sum(dl2[n]["size"] for n in done) == EXPECTED_LOGS_DONE_BYTES
+    assert " logs=dead+done " in first_line(os.path.join(out2, f"{BUCKET}.cleanup.tsv"))
+
+    out3 = str(d / "aged")
+    r3 = cand("--snapshot", snap, "--terra", terra, "--out-dir", out3,
+              "--include-logs", "--include-done-logs", "--logs-older-than", "120")
+    assert r3.returncode == 0, r3.stderr[-300:]
+    dl3, pl3 = _lists(out3)
+    assert set(dl3) == base_del | dead, "p9 (102 days) is too young; dead logs (133 days) are not"
+    assert NAMES["p9"] not in pl3
+    assert "logs=dead+done,older_than=120d " in first_line(os.path.join(out3, f"{BUCKET}.cleanup.tsv"))
+
+    out4 = str(d / "none-old-enough")
+    r4 = cand("--snapshot", snap, "--terra", terra, "--out-dir", out4,
+              "--include-logs", "--logs-older-than", "140")
+    assert r4.returncode == 0
+    assert set(_lists(out4)[0]) == base_del, "no log is 140 days old"
+
+    for bad in (["--include-done-logs"], ["--logs-older-than", "30"],
+                ["--include-logs", "--logs-older-than", "-1"],
+                ["--include-logs", "--logs-older-than", "nan"],
+                ["--include-logs", "--logs-older-than", "inf"],
+                ["--include-logs", "--logs-older-than", "1e9"],
+                ["--include-logs", "--logs-older-than", "soon"]):
+        rb = cand("--snapshot", snap, "--terra", terra, "--out-dir", str(d / "bad"), *bad)
+        assert rb.returncode != 0 and "REFUSING" in rb.stderr, f"{bad} is refused"
+        assert not os.path.exists(str(d / "bad")), "a refusal writes nothing"
+
+
+def test_logs_md5_groups(tmp_path):
+    """G10 vs G2: a log never keeps an md5 group while another copy exists, and a
+    group made only of logs may die whole."""
+    A, C = "submissions/aaaa1111/WGS/wf1", "submissions/cccc3333/WGS/wf3"
+    objs = [
+        # all-log group under the Aborted sub: both go
+        (f"{C}/call-A/stdout", 9, "md5X", "2026-05-01T00:00:00Z"),
+        (f"{C}/call-B/stdout", 9, "md5X", "2026-05-02T00:00:00Z"),
+        # Done: log newer than its twin, so it would be the keeper without G10's
+        # preference -- and k.txt would then be an EXACT_DUPLICATE of a doomed file
+        (f"{A}/call-C/stdout", 7, "md5Y", "2026-06-02T00:00:00Z"),
+        (f"{A}/k.txt", 7, "md5Y", "2026-06-01T00:00:00Z"),
+        # Aborted: log + its only non-log twin; the twin goes to the review list
+        (f"{C}/call-D/stderr", 5, "md5Z", "2026-05-02T00:00:00Z"),
+        (f"{C}/y.bin", 5, "md5Z", "2026-05-01T00:00:00Z"),
+    ]
+    snap, terra = write_snapshot(tmp_path / "g", objs, SUBS, referenced=[])
+    out = str(tmp_path / "g-out")
+    r = cand("--snapshot", snap, "--terra", terra, "--out-dir", out,
+             "--include-logs", "--include-done-logs")
+    assert r.returncode == 0, r.stdout[-400:] + r.stderr[-400:]
+    assert "safety checks: PASS (7/7)" in r.stdout
+    dl, pl = _lists(out)
+    assert set(dl) == {f"{C}/call-A/stdout", f"{C}/call-B/stdout",
+                       f"{A}/call-C/stdout", f"{C}/call-D/stderr"}
+    assert all(v["reasons"] == ["LOG_FILE"] for v in dl.values())
+    assert f"{A}/k.txt" not in dl and f"{A}/k.txt" not in pl, "k.txt is the keeper, not a duplicate"
+    assert set(pl) == {f"{C}/y.bin"} and pl[f"{C}/y.bin"]["reasons"][0] == "LAST_COPY_PROTECTED"
 
 
 def test_zero_byte(tmp_path):
