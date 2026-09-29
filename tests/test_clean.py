@@ -64,7 +64,7 @@ def planned(tmp_path, home, run_plan_with_stub):
         p = json.load(f)
     assert p["executable"] and os.path.realpath(p["commands_out"]) == os.path.realpath(r.wrapper)
     r.write_meta(outcome="planned", plan_id=p["plan_id"], plan_objects=p["plan_objects"],
-                 plan_bytes=p["plan_bytes"])
+                 plan_bytes=p["plan_bytes"], step_seconds={"plan": 1.0})
     return r, p
 
 
@@ -124,6 +124,9 @@ def test_happy_path(planned, calls):
     assert m["outcome"] == "cleaned" and m["clean_rc"] == 0 and m["verify_rc"] == 0
     assert m["deleted_objects"] == p["plan_objects"]
     assert all(m.get(k) for k in ("armed_utc", "cleaned_utc", "verified_utc"))
+    # clean and verify times are added to the scan's step_seconds, not replacing them
+    assert set(m["step_seconds"]) == {"plan", "clean", "verify"}
+    assert m["step_seconds"]["plan"] == 1.0
     # summary + final line
     assert f"gs://{BUCKET}" in res.stdout and r.manifest in res.stdout
     assert "soft-delete" in res.stdout

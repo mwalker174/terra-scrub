@@ -57,7 +57,7 @@ import time
 from datetime import UTC, datetime
 
 from terra_scrub import candidates, http, plan, runs, snapshot, terra
-from terra_scrub.util import human
+from terra_scrub.util import human, step_times
 
 OK_OUTCOMES = {"planned", "not_executable", "review_only", "nothing_to_delete",
                "candidates_only"}
@@ -155,32 +155,47 @@ def scan_one(ns, ws, args, say):
     r = runs.new_run(ns, ws, home_dir)
     meta = {}
     step = "resolve"
+    # wall-clock per step, persisted as each one ends (a failed step keeps its time),
+    # so "scan is slow" reports can say WHICH step was slow
+    secs = {}
+
+    def timed(step, fn, *a, **kw):
+        t0 = time.monotonic()
+        try:
+            return _captured(step, r.log(step), fn, *a, **kw)
+        finally:
+            secs[step] = round(time.monotonic() - t0, 1)
+            r.write_meta(step_seconds=secs)
+
     try:
         sess = http._authed_session()
         say(f"{ns}/{ws}: resolving bucket")
+        t0 = time.monotonic()
         bucket = resolve_bucket(ns, ws, session=sess)
+        secs["resolve"] = round(time.monotonic() - t0, 1)
         r = r.with_bucket(bucket)
         for d in (r.inv_dir, r.cleanup_dir, r.logs_dir):
             os.makedirs(d, exist_ok=True)
-        r.write_meta(started_utc=_now(), step="snapshot", target=f"{ns}/{ws}")
+        r.write_meta(started_utc=_now(), step="snapshot", target=f"{ns}/{ws}",
+                     step_seconds=secs)
 
         # 1. listing BEFORE the Terra read (docs/SAFETY.md §2)
         step = "snapshot"
         say(f"{ns}/{ws}: snapshot gs://{bucket} (progress: {r.log('snapshot')})")
-        n_obj, n_bytes = _captured(step, r.log(step), snapshot.snapshot_bucket, bucket,
-                                   r.snapshot, page_size=args.page_size, session=sess)
+        n_obj, n_bytes = timed(step, snapshot.snapshot_bucket, bucket,
+                               r.snapshot, page_size=args.page_size, session=sess)
         r.write_meta(step="context", snapshot_objects=n_obj, snapshot_bytes=n_bytes)
 
         # 2. context AFTER the listing
         step = "context"
         say(f"{ns}/{ws}: capturing Terra context")
-        _captured(step, r.log(step), terra.capture_context, ns, ws, r.context, session=sess)
+        timed(step, terra.capture_context, ns, ws, r.context, session=sess)
         r.write_meta(step="candidates")
 
         # 3. candidates (offline, guards G1-G10)
         step = "candidates"
         say(f"{ns}/{ws}: building candidate lists")
-        _captured(step, r.log(step), candidates.main, candidate_argv(r, args))
+        timed(step, candidates.main, candidate_argv(r, args))
         del_n, del_b = _tally(r.manifest)
         prot_n, prot_b = _tally(r.protected)
         meta = r.write_meta(candidate_objects=del_n, candidate_bytes=del_b,
@@ -195,17 +210,16 @@ def scan_one(ns, ws, args, say):
             step = "plan-context"
             r.write_meta(step=step)
             say(f"{ns}/{ws}: capturing plan-time Terra context")
-            _captured(step, r.log(step), terra.capture_context, ns, ws, r.plan_context,
-                      session=sess)
+            timed(step, terra.capture_context, ns, ws, r.plan_context, session=sess)
             step = "plan"
             r.write_meta(step=step)
             say(f"{ns}/{ws}: live re-check of {del_n:,} rows ({args.workers} workers)")
             pargv = ["--manifest", r.manifest, "--terra", r.plan_context,
-                     "--workers", str(args.workers)]
+                     "--workers", str(args.workers), "--shards", str(args.shards)]
             pp = plan_prefix(args.prefix)
             if pp is not None:
                 pargv += ["--prefix", pp]
-            _captured(step, r.log(step), plan.main, pargv)
+            timed(step, plan.main, pargv)
             with open(r.plan_json) as fh:
                 p = json.load(fh)
             outcome = "planned" if p.get("executable") else "not_executable"
@@ -294,6 +308,8 @@ def summary_block(m, args):
     if m.get("outcome") == "failed":
         rows.append(("FAILED", str(m.get("error", ""))[:300]))
     rows.append(("outcome", m.get("outcome", "?")))
+    if m.get("step_seconds"):
+        rows.append(("time", step_times(m["step_seconds"], runs.STEPS)))
     if r.bucket:
         rows.append(("run dir", r.root))
     rows.append(("next", next_step(m, args)))
@@ -345,8 +361,13 @@ def add_arguments(ap: argparse.ArgumentParser) -> None:
     g.add_argument("--logs-older-than", type=candidates.log_age_days, default=0.0,
                    metavar="DAYS",
                    help="with --include-logs: only logs older than DAYS")
-    ap.add_argument("--workers", type=int, default=10,
-                    help="parallel live stats during planning (default 10)")
+    ap.add_argument("--workers", type=int, default=32,
+                    help="parallel live stats during planning (default 32). Each stat "
+                         "is one GET of ~150 ms, so rows/s scales with this; 10 workers "
+                         "left a 460k-row plan running for hours")
+    ap.add_argument("--shards", type=plan.shard_count, default=8,
+                    help="the plan's wrapper deletes in this many parallel pieces "
+                         "(default 8). One deleter manages ~12 objects/s")
     ap.add_argument("--page-size", type=int, default=1000,
                     help="objects per listing page for the snapshot (default 1000)")
     ap.add_argument("--no-plan", action="store_true",

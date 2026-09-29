@@ -42,8 +42,8 @@ has typed the plan id at its prompt (or passed it as `--confirm`). The deny rule
 - **"No delete verb."** `plan` does not have a dry-run mode that some flag could
   switch off. The file has no code path that deletes. Its outputs are a JSON summary, a
   URI list and a shell wrapper, and the wrapper holds the only deleter invocation in
-  the package: `exec gcloud storage rm -I < <uris>`, the same stdin URI-list format
-  that `gsutil rm -I` / FISS `mop` used.
+  the package: `gcloud storage rm -I < <piece>`, the same stdin URI-list format
+  that `gsutil rm -I` / FISS `mop` used, run once per piece of the URI list (§7).
   Only `clean` runs that wrapper, on a person's typed confirmation. No other module
   runs it.
 - **Exempt modules, and why:**
@@ -290,7 +290,10 @@ person to read.
 
 Outputs next to the manifest: `<manifest>.plan.json` always; for an executable plan
 only, `<manifest>.plan.uris.txt` (one `gs://` URI per line, the `gcloud storage rm -I` stdin format) and `<manifest>.plan.sh`
-(the wrapper, with `CONFIRM=""`).
+(the wrapper, with `CONFIRM=""`). The URI list is the one audited artifact: `clean`,
+`approve` and `verify` check it and nothing else. The wrapper writes its pieces
+(`<manifest>.plan.uris.txt.part-<n>`, plus a `.log` for each) only when it runs, and
+it writes them from the list it has just verified.
 
 ---
 
@@ -351,9 +354,22 @@ separate actions:
    neither is on `PATH`) must equal the value recorded at plan time, and its line
    count must equal `plan_objects`. A list changed after arming is refused, not
    deleted. Check the bucket's soft-delete policy first (§8): the window may be 0.
-   The wrapper runs `gcloud storage rm -I` without `--continue-on-error`, so it stops
-   at the first object that fails; `verify` (§8) then shows exactly what a partial run
-   removed, and you re-plan (inside the 24 h window) rather than retry blindly.
+   After the check it splits the list into `plan_objects / shards` contiguous pieces
+   (`plan --shards`, default 8, max 32; recorded as `shards` in plan.json). It then
+   hashes the pieces again, in order, and refuses unless together they are exactly
+   the verified list. So the deleters read the live-validated set and nothing else.
+   It runs one `gcloud storage rm -I` per piece, all at once. A single deleter looks
+   up every URI serially before deleting it, so it manages ~12 objects/s: about 9 h
+   for 400k objects. Eight pieces take about 75 min.
+   Each piece runs without `--continue-on-error` and stops at its first failed
+   object. That piece's failure also stops the rest: each piece runs in its own
+   process group, and the wrapper sends SIGTERM to every group still running. It
+   does the same when it is interrupted (INT/TERM), so no deleter outlives it. It
+   refuses to start without `sleep` on `PATH`, because that is how it watches the
+   pieces. Stopping is not instant: deletes already in flight in the other pieces
+   finish, so a failed run can remove more than the objects before the failure.
+   `verify` (§8) then shows exactly what a partial run removed, and you re-plan
+   (inside the 24 h window) rather than retry blindly.
 
 `terra-scrub approve` with no plan id lists pending plans with their current age,
 executable flag and armed state.

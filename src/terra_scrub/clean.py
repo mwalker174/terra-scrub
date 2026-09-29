@@ -38,6 +38,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from contextlib import redirect_stdout
 from datetime import UTC, datetime
 
@@ -238,15 +239,18 @@ def run(args: argparse.Namespace) -> int:
     r.write_meta(armed_utc=_now())
 
     print(f"\n-- running {r.wrapper} (log: {r.log('clean')})", flush=True)
+    secs = r.read_meta().get("step_seconds") or {}
+    t0 = time.monotonic()
     rc, out = _run_wrapper(r)
+    secs["clean"] = round(time.monotonic() - t0, 1)
     refusals = ([ln for ln in out.splitlines() if ln.lower().startswith("refusing")]
                 if rc != 0 else [])
     # cleaned_utc means "the wrapper got past its own self-check" (status reads it as
     # "cleaned"); a self-refusal deleted nothing, so it is not recorded as a clean.
     if refusals:
-        r.write_meta(clean_rc=rc, clean_refused_utc=_now())
+        r.write_meta(clean_rc=rc, clean_refused_utc=_now(), step_seconds=secs)
     else:
-        r.write_meta(clean_rc=rc, cleaned_utc=_now())
+        r.write_meta(clean_rc=rc, cleaned_utc=_now(), step_seconds=secs)
     if rc != 0:
         if refusals:
             sys.exit(f"REFUSED by the wrapper's own self-check (rc={rc}); nothing deleted:\n  "
@@ -262,9 +266,11 @@ def run(args: argparse.Namespace) -> int:
         return 0 if rc == 0 else 1
 
     print(f"\n-- verifying (log: {r.log('verify')})", flush=True)
+    t0 = time.monotonic()
     vrc, vtext = _run_verify(r, args.workers)
+    secs["verify"] = round(time.monotonic() - t0, 1)
     ok = vrc == 0
-    r.write_meta(verify_rc=vrc, verified_utc=_now(),
+    r.write_meta(verify_rc=vrc, verified_utc=_now(), step_seconds=secs,
                  deleted_objects=p["plan_objects"] if ok else None,
                  outcome="cleaned" if ok else "cleaned-verify-failed")
     if ok:

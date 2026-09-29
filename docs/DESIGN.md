@@ -84,9 +84,12 @@ Keep public function names from the sources (`read_snapshot`, `api_get`, `human`
   rationale (ported from the docstrings themselves — do not read the 158 KB progress log).
 - `lookup_terra_bucket.py` contains a hard-coded bearer token. DO NOT copy it. `lookup`
   uses `http.api_get`.
-- Wrapper script: keep `exec gcloud storage rm -I < <uris>` exactly (tested; same stdin
-  URI-list format that `gsutil rm -I` / `fissfc mop` used; no `--continue-on-error`, so it
-  stops at the first failure). No new deleter option in v0.1.
+- Wrapper script: the deleter is `gcloud storage rm -I < <piece>` (tested; same stdin
+  URI-list format that `gsutil rm -I` / `fissfc mop` used; no `--continue-on-error`).
+  The wrapper splits the verified URI list into `plan --shards` contiguous pieces
+  (default 8) and runs one deleter per piece, because one deleter looks each URI up
+  serially and manages ~12 objects/s. The first failed piece stops the others (see
+  docs/SAFETY.md §7). No other deleter option.
 
 ## Estate drivers: the ordering invariant is enforced, not documented
 
