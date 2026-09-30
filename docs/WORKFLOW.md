@@ -37,6 +37,15 @@ object count and bytes, and the next command.
   Aborted/Failed submissions, last copies included (reason `LOG_FILE`, G10). Add
   `--include-done-logs` for logs under Done submissions, and `--logs-older-than DAYS`
   to keep recent ones. Return codes and scripts are always kept.
+- `--workers N` sets how many live stats `plan` runs at once (default 32). `plan` sends
+  one GET per delete row, at roughly 150 ms each, so a 460k-row bucket needs about
+  2.5 h at 8 workers and about 40 min at 32. Raise it for buckets with many objects.
+- `--shards N` sets how many parallel pieces the plan's wrapper deletes in (default 8,
+  max 32). One `gcloud storage rm -I` manages ~12 objects/s. If one piece fails, the
+  wrapper stops the others (docs/SAFETY.md §7).
+
+The summary ends with a `time:` line giving each step's wall-clock time (also in
+`run.json` as `step_seconds`). When a scan is slow, that line shows which step was slow.
 
 **2. Status** (read-only):
 
@@ -103,8 +112,10 @@ Check the bucket's soft-delete policy before cleaning. The window may be 0 (SAFE
 ```
 
 `run.json`'s `outcome` is `planned` after a scan that produced an executable plan;
-`clean` needs that. `clean` adds `armed_utc`, `clean_rc`, `cleaned_utc`, `verify_rc`,
-`verified_utc`, `deleted_objects`, and sets `outcome` to `cleaned`,
+`clean` needs that. `step_seconds` maps each step (`resolve`, `snapshot`, `context`,
+`candidates`, `plan-context`, `plan`) to its wall-clock seconds; a step that failed
+still records its time. `clean` adds `armed_utc`, `clean_rc`, `cleaned_utc`, `verify_rc`,
+`verified_utc`, `deleted_objects`, adds `clean` and `verify` to `step_seconds`, and sets `outcome` to `cleaned`,
 `cleaned-verify-failed` or `cleaned-unverified`. A cleaned run cannot be cleaned
 again; scan again.
 
@@ -136,6 +147,7 @@ create this layout, and `verify` uses it to find the "before" snapshot.
   cleanup/<key>/<bucket>.cleanup.tsv.plan.json      plan summary
   cleanup/<key>/<bucket>.cleanup.tsv.plan.uris.txt  gcloud storage rm -I input (executable plans only)
   cleanup/<key>/<bucket>.cleanup.tsv.plan.sh        wrapper (CONFIRM gate; executable plans only)
+  cleanup/<key>/<bucket>.cleanup.tsv.plan.uris.txt.part-<n>[.log]  wrapper's pieces + logs (written when it runs)
   logs/                                        per-bucket logs (estate drivers)
   scan-status.json                             per-bucket outcome (estate scan)
 ```

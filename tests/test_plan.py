@@ -379,15 +379,17 @@ def _bash():
     return "/bin/bash" if os.path.exists("/bin/bash") else "/usr/bin/bash"
 
 
-def _sha_only_bin(tmp_path):
-    """A PATH holding ONLY a sha256 tool: the wrapper can verify, but no gcloud
-    (nor anything else) is reachable, so even a broken gate cannot delete."""
+def _sha_only_bin(tmp_path, name="shabin"):
+    """A PATH holding ONLY a sha256 tool and `sleep` (the wrapper supervises its
+    parallel pieces with it): the wrapper can verify, but no gcloud (nor anything
+    else) is reachable, so even a broken gate cannot delete."""
     tool = shutil.which("sha256sum") or shutil.which("shasum")
     if not tool:
         pytest.skip("neither sha256sum nor shasum on this machine")
-    b = tmp_path / "shabin"
+    b = tmp_path / name
     b.mkdir()
     os.symlink(tool, b / os.path.basename(tool))
+    os.symlink(shutil.which("sleep"), b / "sleep")
     return str(b)
 
 
@@ -422,10 +424,11 @@ def test_armed_wrapper_refuses_modified_uri_list(tmp_path, run_plan_with_stub):
     _arm_copy(sh, p["plan_id"])
     shabin = _sha_only_bin(tmp_path)
 
-    # positive control: unmodified list passes the self-check and reaches exec, which
-    # cannot find gcloud (PATH has only the sha tool) -> 127, not the refusal path
+    # positive control: unmodified list passes the self-check and reaches the deleters,
+    # which cannot find gcloud (PATH has only the sha tool) -> 127, not the refusal path
     ok = _run_wrapper(sh, shabin)
-    assert ok.returncode == 127 and "refusing" not in ok.stdout and "gcloud" in ok.stderr, \
+    assert ok.returncode == 127 and "refusing" not in ok.stdout \
+        and "gcloud: command not found" in ok.stdout, \
         f"an intact list passes the check (rc={ok.returncode}: {ok.stdout}{ok.stderr})"
 
     # an appended URI: sha256 no longer matches -> refused before exec
@@ -455,6 +458,143 @@ def test_armed_wrapper_refuses_line_count_mismatch(tmp_path, run_plan_with_stub)
                              f"WANT_LINES={len(EXPECTED_DELETE) + 1}"))
     rr = _run_wrapper(sh, _sha_only_bin(tmp_path))
     assert rr.returncode == 1 and "lines but the plan has" in rr.stdout, rr.stdout
+
+
+FAKE_GCLOUD = """#!/bin/bash
+# fake deleter: records its argv and stdin, deletes nothing. On SIGTERM it takes
+# {linger} s to shut down (a real deleter finishing its in-flight requests), then
+# leaves an exit marker.
+trap 'sleep {linger}; echo gone > "{out}/exit.$$"; exit 143' TERM
+[ "$*" = "storage rm -I" ] || {{ echo "unexpected argv: $*"; exit 99; }}
+while IFS= read -r l; do printf '%s\\n' "$l"; done > "{out}/piece.$$"
+while IFS= read -r l; do
+    if [ "$l" = "{fail_on}" ]; then echo "fake failure on $l"; exit 3; fi
+done < "{out}/piece.$$"
+sleep {nap}
+"""
+
+
+def _fake_gcloud_bin(tmp_path, *, fail_on="", nap=0, linger=0):
+    b = _sha_only_bin(tmp_path, "fakebin")
+    out = tmp_path / "fake-out"
+    out.mkdir()
+    g = os.path.join(b, "gcloud")
+    with open(g, "w") as f:
+        f.write(FAKE_GCLOUD.format(out=out, fail_on=fail_on, nap=nap, linger=linger))
+    os.chmod(g, 0o755)
+    return b, out
+
+
+def _armed_plan(tmp_path, run_plan_with_stub, *extra):
+    tsv, fresh = make_plan_inputs(tmp_path / "plan-shards")
+    r = run_plan_with_stub("--manifest", tsv, "--terra", fresh, "--workers", "4", *extra)
+    assert r.returncode == 0, r.stderr
+    p = _load(tsv + ".plan.json")
+    _arm_copy(p["commands_out"], p["plan_id"])
+    return p
+
+
+@pytest.mark.parametrize("shards,want", [("8", 5), ("2", 2), ("1", 1)])
+def test_shard_count_never_leaves_an_empty_piece(tmp_path, run_plan_with_stub, shards, want):
+    """5 planned rows: --shards 8 gives 5 pieces of 1, --shards 2 gives 3+2."""
+    p = _armed_plan(tmp_path, run_plan_with_stub, "--shards", shards)
+    assert p["shards"] == want
+    with open(p["commands_out"]) as f:
+        assert f"SHARDS={want}\n" in f.read()
+
+
+def test_sharded_wrapper_deletes_exactly_the_list_in_parallel(tmp_path, run_plan_with_stub):
+    p = _armed_plan(tmp_path, run_plan_with_stub, "--shards", "2")
+    b, out = _fake_gcloud_bin(tmp_path)
+    rr = _run_wrapper(p["commands_out"], b)
+    assert rr.returncode == 0, rr.stdout + rr.stderr
+    pieces = sorted(x for x in os.listdir(out) if x.startswith("piece."))
+    assert len(pieces) == 2, f"one deleter per piece ({pieces})"
+    fed = [ln for x in pieces for ln in _lines(out / x)]
+    assert sorted(fed) == sorted(_lines(p["uris_out"])) and len(fed) == len(set(fed)), \
+        "the pieces together are exactly the URI list, each URI once"
+    assert "piece 1/2: done" in rr.stdout and "piece 2/2: done" in rr.stdout
+
+
+def test_sharded_wrapper_runs_pieces_concurrently(tmp_path, run_plan_with_stub):
+    import time
+    p = _armed_plan(tmp_path, run_plan_with_stub, "--shards", "5")
+    b, _out = _fake_gcloud_bin(tmp_path, nap=3)
+    t0 = time.monotonic()
+    rr = _run_wrapper(p["commands_out"], b)
+    took = time.monotonic() - t0
+    assert rr.returncode == 0, rr.stdout
+    assert took < 9, f"5 pieces x 3 s ran concurrently, not serially ({took:.1f}s)"
+
+
+def test_one_failed_piece_stops_the_others(tmp_path, run_plan_with_stub):
+    import time
+    p = _armed_plan(tmp_path, run_plan_with_stub, "--shards", "5")
+    first = _lines(p["uris_out"])[0]
+    b, _out = _fake_gcloud_bin(tmp_path, fail_on=first, nap=30)
+    t0 = time.monotonic()
+    rr = _run_wrapper(p["commands_out"], b)
+    took = time.monotonic() - t0
+    assert rr.returncode == 3, f"the failing piece's rc is the wrapper's rc ({rr.stdout})"
+    assert "piece 1/5: FAILED (rc=3)" in rr.stdout and "stopping the others" in rr.stdout
+    assert took < 15, f"the other pieces (napping 30 s) were stopped ({took:.1f}s)"
+    # the pieces we stopped are reported as stopped, not as further failures
+    assert rr.stdout.count("FAILED") == 1 and rr.stdout.count(": stopped (rc=") == 4, rr.stdout
+
+
+def test_interrupted_wrapper_leaves_no_deleter_running(tmp_path, run_plan_with_stub):
+    """Each piece has its own process group, so a Ctrl-C to the wrapper's group would
+    not reach them; the wrapper's INT/TERM trap has to stop them itself."""
+    import signal
+    import time
+    p = _armed_plan(tmp_path, run_plan_with_stub, "--shards", "3")
+    b, out = _fake_gcloud_bin(tmp_path, nap=30, linger=2)
+    proc = subprocess.Popen([_bash(), p["commands_out"]], stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True, env={"PATH": b})
+    deadline = time.monotonic() + 10
+    while len([x for x in os.listdir(out) if x.startswith("piece.")]) < 3 \
+            and time.monotonic() < deadline:
+        time.sleep(0.1)
+    pids = [int(x.split(".")[1]) for x in os.listdir(out) if x.startswith("piece.")]
+    assert len(pids) == 3, "all three pieces started"
+    proc.send_signal(signal.SIGTERM)
+    stdout, _ = proc.communicate(timeout=10)
+    assert proc.returncode == 130 and "stopping every piece" in stdout, stdout
+    # every deleter had finished shutting down (2 s each) BEFORE the wrapper returned:
+    # clean runs verify the moment it does
+    assert sorted(x for x in os.listdir(out) if x.startswith("exit.")) == \
+        sorted(f"exit.{pid}" for pid in pids), "the wrapper waited for every piece"
+    alive = []
+    for pid in pids:
+        try:
+            os.kill(pid, 0)
+            alive.append(pid)
+        except ProcessLookupError:
+            pass
+    assert not alive, f"no deleter outlives the wrapper ({alive})"
+
+
+def test_wrapper_refuses_without_sleep(tmp_path, run_plan_with_stub):
+    p = _armed_plan(tmp_path, run_plan_with_stub)
+    b = _sha_only_bin(tmp_path)
+    os.unlink(os.path.join(b, "sleep"))
+    rr = _run_wrapper(p["commands_out"], b)
+    assert rr.returncode == 1 and "refusing: sleep is not on PATH" in rr.stdout, rr.stdout
+    # the URI-list checks come first: a modified list is reported as that, not as sleep
+    with open(p["uris_out"], "a") as f:
+        f.write(f"gs://{BUCKET}/submissions/aaaa1111/smuggled.bam\n")
+    rr = _run_wrapper(p["commands_out"], b)
+    assert rr.returncode == 1 and "sha256 changed" in rr.stdout \
+        and "sleep" not in rr.stdout, rr.stdout
+
+
+def test_shards_flag_is_bounded():
+    import argparse
+    with pytest.raises(argparse.ArgumentTypeError):
+        plan.shard_count("0")
+    with pytest.raises(argparse.ArgumentTypeError):
+        plan.shard_count(str(plan.MAX_SHARDS + 1))
+    assert plan.shard_count("8") == 8
 
 
 def test_non_executable_replan_leaves_uri_list(tmp_path, run_plan_with_stub, live):

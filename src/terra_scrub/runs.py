@@ -12,7 +12,8 @@ uses, so `verify.guess_before` and the low-level commands keep working on it:
         cleanup/<key>/<bucket>.cleanup.protected.tsv
         cleanup/<key>/<bucket>.cleanup.tsv.plan.json / .plan.uris.txt / .plan.sh
         logs/<step>.log                      stdout+stderr of each low-level step
-        run.json                             what this run is (target, bucket, stamps, outcome)
+        run.json                             what this run is (target, bucket, stamps, outcome,
+                                             step_seconds: wall-clock per step)
 
 <home> is $TERRA_SCRUB_HOME or ~/.terra-scrub. Nothing here touches the network.
 """
@@ -22,6 +23,11 @@ import json
 import os
 import time
 from dataclasses import dataclass
+
+# run order of the steps timed in run.json `step_seconds` (scan's, then clean's).
+# run.json is written with sorted keys, so this is what puts them back in order.
+STEPS = ("resolve", "snapshot", "context", "candidates", "plan-context", "plan",
+         "clean", "verify")
 
 
 def home() -> str:

@@ -178,6 +178,20 @@ def live_stat(session, bucket, name):
     return "ok", r.json()
 
 
+MAX_SHARDS = 32
+
+
+def shard_count(text):
+    """argparse type for --shards: an int in [1, MAX_SHARDS]."""
+    try:
+        v = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not an integer: {text!r}") from None
+    if not 1 <= v <= MAX_SHARDS:
+        raise argparse.ArgumentTypeError(f"must be in [1, {MAX_SHARDS}] (got {v})")
+    return v
+
+
 def add_arguments(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--manifest", required=True,
                     help="a *.cleanup.tsv or *.cleanup.protected.tsv from "
@@ -195,7 +209,11 @@ def add_arguments(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--allow-stale-manifest", action="store_true",
                     help="downgrade the manifest-age check to a warning (review only "
                          "-- a plan you intend to execute must be regenerated)")
-    ap.add_argument("--workers", type=int, default=10)
+    ap.add_argument("--workers", type=int, default=32,
+                    help="parallel live stats (default 32; one GET per row)")
+    ap.add_argument("--shards", type=shard_count, default=8,
+                    help="the wrapper deletes in this many parallel pieces (default 8, "
+                         f"max {MAX_SHARDS}). One deleter manages ~12 objects/s")
     ap.add_argument("--limit", type=int, default=0,
                     help="stat only the first N lines (smoke test; the plan is then "
                          "explicitly partial)")
@@ -427,10 +445,15 @@ def run(args: argparse.Namespace) -> int:
     if args.limit:
         reasons.append(f"--limit {args.limit}: PARTIAL plan")
     executable = not reasons
+    # contiguous pieces of `chunk` lines; n_shards is recomputed from chunk so a small
+    # plan never gets an empty piece (e.g. 9 rows / 4 -> 3 pieces of 3)
+    chunk = max(1, -(-n_del // args.shards))
+    n_shards = max(1, -(-n_del // chunk))
     sh = f"""#!/bin/bash
 # Delete plan for gs://{bucket} -- generated {now.isoformat()}
 # from {os.path.basename(args.manifest)} (plan_id {plan_id}, sha256 of the URI list
-# {uri_sha}, {n_del:,} objects / {b_del:,} bytes).
+# {uri_sha}, {n_del:,} objects / {b_del:,} bytes), deleted in {n_shards} parallel
+# pieces of up to {chunk:,} objects.
 #
 # Reviewed pointers re-checked live at plan time: {'ON' if pointer_check else 'OFF -- DO NOT RUN THIS'}
 # Recovery after this runs is a soft-delete restore, and only inside the bucket's
@@ -455,14 +478,17 @@ test -f "{os.path.abspath(out_uris)}" || {{ echo "missing {os.path.abspath(out_u
 URIS="{os.path.abspath(out_uris)}"
 WANT_SHA256="{uri_sha}"
 WANT_LINES={n_del}
+SHARDS={n_shards}
+CHUNK={chunk}
 if command -v sha256sum >/dev/null 2>&1; then
-    GOT_SHA256="$(sha256sum < "$URIS")"
+    sha256() {{ sha256sum; }}
 elif command -v shasum >/dev/null 2>&1; then
-    GOT_SHA256="$(shasum -a 256 < "$URIS")"
+    sha256() {{ shasum -a 256; }}
 else
     echo "refusing: neither sha256sum nor shasum is on PATH -- cannot verify the URI list"
     exit 1
 fi
+GOT_SHA256="$(sha256 < "$URIS")"
 GOT_SHA256="${{GOT_SHA256%% *}}"
 if [ "$GOT_SHA256" != "$WANT_SHA256" ]; then
     echo "refusing: URI list sha256 changed since planning (plan_id {plan_id})"
@@ -479,8 +505,107 @@ if [ "$GOT_LINES" -ne "$WANT_LINES" ]; then
     echo "refusing: URI list has $GOT_LINES lines but the plan has $WANT_LINES objects"
     exit 1
 fi
-# Stops at the first failed object (no --continue-on-error): verify diagnoses a partial run.
-exec gcloud storage rm -I < "{os.path.abspath(out_uris)}"
+command -v sleep >/dev/null 2>&1 || {{
+    echo "refusing: sleep is not on PATH -- cannot supervise the parallel deletes"; exit 1; }}
+
+# Split the list into $SHARDS contiguous pieces of $CHUNK lines, one deleter each.
+# One deleter runs at ~12 objects/s: it looks every URI up serially before deleting
+# it. The pieces are then re-hashed: in order, they must be byte-for-byte the list
+# verified above, so the deleters read exactly the live-validated set.
+PART="$URIS.part"
+i=1
+n=0
+exec 3>"$PART-$i"
+while IFS= read -r line || [ -n "$line" ]; do
+    if [ "$n" -eq "$CHUNK" ]; then i=$((i + 1)); n=0; exec 3>"$PART-$i"; fi
+    printf '%s\\n' "$line" >&3
+    n=$((n + 1))
+done < "$URIS"
+exec 3>&-
+if [ "$i" -ne "$SHARDS" ]; then
+    echo "refusing: split produced $i pieces but the plan has $SHARDS"
+    exit 1
+fi
+GOT_SHA256="$(
+    i=1
+    while [ "$i" -le "$SHARDS" ]; do
+        while IFS= read -r line || [ -n "$line" ]; do printf '%s\\n' "$line"; done < "$PART-$i"
+        i=$((i + 1))
+    done | sha256)"
+GOT_SHA256="${{GOT_SHA256%% *}}"
+if [ "$GOT_SHA256" != "$WANT_SHA256" ]; then
+    echo "refusing: the split pieces do not add up to the planned URI list (plan_id {plan_id})"
+    exit 1
+fi
+
+# Each piece stops at its first failed object (no --continue-on-error). When one
+# piece fails, or this script is interrupted, every other piece is stopped: each runs
+# in its own process group (set -m), which gets SIGTERM. Deletes already in flight
+# finish; verify then shows exactly what a partial run removed (docs/SAFETY.md §7).
+# An interrupted wrapper returns only after every piece has exited (a piece still
+# running after 30 s gets SIGKILL), so `clean` never starts verify under a live deleter.
+set -m
+RUNNING=""
+stop_all() {{
+    for e in $RUNNING; do kill -TERM -- "-${{e#*:}}" 2>/dev/null || true; done
+}}
+join_all() {{
+    t=0
+    for e in $RUNNING; do
+        p="${{e#*:}}"
+        while kill -0 "$p" 2>/dev/null; do
+            if [ "$t" -ge 30 ]; then kill -KILL -- "-$p" 2>/dev/null || true; fi
+            sleep 1
+            t=$((t + 1))
+        done
+        wait "$p" 2>/dev/null || true
+    done
+}}
+trap 'echo "interrupted: stopping every piece"; stop_all; join_all; exit 130' INT TERM
+i=1
+while [ "$i" -le "$SHARDS" ]; do
+    gcloud storage rm -I < "$PART-$i" > "$PART-$i.log" 2>&1 &
+    RUNNING="$RUNNING $i:$!"
+    i=$((i + 1))
+done
+echo "deleting $WANT_LINES objects in $SHARDS parallel pieces (logs: $PART-<n>.log)"
+RC=0
+STOPPED=0
+while [ -n "$RUNNING" ]; do
+    STILL=""
+    for e in $RUNNING; do
+        k="${{e%%:*}}"
+        p="${{e#*:}}"
+        if kill -0 "$p" 2>/dev/null; then
+            STILL="$STILL $e"
+        elif wait "$p"; then
+            echo "piece $k/$SHARDS: done"
+        else
+            s=$?
+            if [ "$STOPPED" -eq 1 ]; then
+                echo "piece $k/$SHARDS: stopped (rc=$s)"
+            else
+                echo "piece $k/$SHARDS: FAILED (rc=$s)"
+                if [ "$RC" -eq 0 ]; then RC=$s; fi
+            fi
+        fi
+    done
+    RUNNING="$STILL"
+    if [ "$RC" -ne 0 ] && [ "$STOPPED" -eq 0 ] && [ -n "$RUNNING" ]; then
+        echo "a piece failed: stopping the others"
+        stop_all
+        STOPPED=1
+    fi
+    if [ -n "$RUNNING" ]; then sleep 1; fi
+done
+trap - INT TERM
+i=1
+while [ "$i" -le "$SHARDS" ]; do
+    echo "== piece $i/$SHARDS log"
+    while IFS= read -r line || [ -n "$line" ]; do printf '%s\\n' "$line"; done < "$PART-$i.log"
+    i=$((i + 1))
+done
+exit "$RC"
 """
 
     # The URI list and the wrapper are written ONLY for a plan with no disqualifying
@@ -520,7 +645,7 @@ exec gcloud storage rm -I < "{os.path.abspath(out_uris)}"
             "contexts": [{"path": p, "captured_utc": c.isoformat()} for p, c in ctx_ages],
             "plan_objects": n_del, "plan_bytes": b_del,
             "objects_by_status": tally, "bytes_by_status": bytes_by,
-            "uri_list_sha256": uri_sha,
+            "uri_list_sha256": uri_sha, "shards": n_shards,
             "uris_out": (os.path.abspath(out_uris) if executable else None),
             "commands_out": (os.path.abspath(out_sh) if executable else None),
             "uris_written": executable, "commands_written": executable,

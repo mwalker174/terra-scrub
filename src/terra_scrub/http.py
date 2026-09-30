@@ -30,12 +30,21 @@ _SCOPES = (
 )
 
 
+# Connections kept open per host. requests' default is 10, so a `--workers 24` stat
+# pool (verify's default) threw away 14 connections after every round and paid a
+# fresh TLS handshake for each. Sized above any sane --workers value.
+POOL_MAXSIZE = 64
+
+
 def _authed_session():
     import google.auth
     import google.auth.transport.requests
+    import requests.adapters
 
     creds, _ = google.auth.default(scopes=list(_SCOPES))
-    return google.auth.transport.requests.AuthorizedSession(creds)
+    sess = google.auth.transport.requests.AuthorizedSession(creds)
+    sess.mount("https://", requests.adapters.HTTPAdapter(pool_maxsize=POOL_MAXSIZE))
+    return sess
 
 
 def api_get(url, params=None, session=None, *, timeout=120):

@@ -123,6 +123,12 @@ def test_scan_end_to_end_order_files_and_summary(monkeypatch, tmp_path):
                                                                  EXPECTED_PROTECTED_BYTES)
     assert (meta["snapshot_objects"], meta["snapshot_bytes"]) == (len(S), TOTAL_BYTES)
     assert meta["started_utc"] and meta["finished_utc"]
+    # every step's wall-clock lands in run.json, in run order, and in the summary
+    assert sorted(meta["step_seconds"], key=runs.STEPS.index) == calls
+    assert all(isinstance(v, float) and v >= 0 for v in meta["step_seconds"].values())
+    assert "time:" in res.stdout and "(total " in res.stdout
+    line = next(ln for ln in res.stdout.splitlines() if "time:" in ln)
+    assert [w for w in line.split() if w in runs.STEPS] == calls, "summary lists steps in run order"
     # the low-level chatter went to the logs, not the terminal
     with open(r.log("candidates")) as f:
         assert "safety checks: PASS" in f.read()
@@ -221,6 +227,8 @@ def test_scan_workspace_without_bucket_refuses(monkeypatch, tmp_path):
     assert calls == ["resolve"]
     assert "no bucketName" in res.stdout
     assert r is None     # nothing written for a workspace that never resolved
+    # ...but the time the failed resolve took is still reported
+    assert "time:" in res.stdout and "resolve " in res.stdout
 
 
 def test_scan_bad_target_refuses(monkeypatch, tmp_path):
@@ -259,3 +267,16 @@ def test_scan_home_flag(monkeypatch, tmp_path):
 def test_scan_help(argv):
     res = run_cmd(scan, argv)
     assert res.returncode == 0 and "ordering invariant" in res.stdout
+
+
+def test_scan_records_time_of_the_step_that_failed(monkeypatch, tmp_path):
+    install_fakes(monkeypatch, tmp_path)
+
+    def boom(ns, ws, out, session=None):
+        raise RuntimeError("terra down")
+    monkeypatch.setattr(terra, "capture_context", boom)
+    res = run_cmd(scan, ["ns/ws"])
+    assert res.returncode == 1
+    meta = runs.latest_run("ns", "ws").read_meta()
+    assert meta["outcome"] == "failed" and meta["step"] == "context"
+    assert set(meta["step_seconds"]) == {"resolve", "snapshot", "context"}

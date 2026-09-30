@@ -32,7 +32,7 @@ from datetime import UTC, datetime
 
 from terra_scrub import runs
 from terra_scrub.approve import MAX_AGE_H, _age_h, _confirm_lines, _is_empty_token
-from terra_scrub.util import human
+from terra_scrub.util import human, step_times
 
 
 class _Unreadable(Exception):
@@ -160,6 +160,8 @@ def detail_block(d):
         rc = m.get("verify_rc")
         rows.append(("verify", "not run" if rc is None else
                      ("OK" if rc == 0 else f"FAILED (rc={rc})")))
+    if m.get("step_seconds"):
+        rows.append(("time", step_times(m["step_seconds"], runs.STEPS)))
     rows.append(("run dir", r.root))
     rows.append(("next", d["next"]))
     w = max(len(k) for k, _ in rows) + 1
