@@ -156,7 +156,8 @@ def scan_one(ns, ws, args, say):
     meta = {}
     step = "resolve"
     # wall-clock per step, persisted as each one ends (a failed step keeps its time),
-    # so "scan is slow" reports can say WHICH step was slow
+    # so "scan is slow" reports can say WHICH step was slow. An unresolved workspace
+    # has no run dir to persist into; its resolve time is in the returned summary only.
     secs = {}
 
     def timed(step, fn, *a, **kw):
@@ -171,8 +172,10 @@ def scan_one(ns, ws, args, say):
         sess = http._authed_session()
         say(f"{ns}/{ws}: resolving bucket")
         t0 = time.monotonic()
-        bucket = resolve_bucket(ns, ws, session=sess)
-        secs["resolve"] = round(time.monotonic() - t0, 1)
+        try:
+            bucket = resolve_bucket(ns, ws, session=sess)
+        finally:
+            secs["resolve"] = round(time.monotonic() - t0, 1)
         r = r.with_bucket(bucket)
         for d in (r.inv_dir, r.cleanup_dir, r.logs_dir):
             os.makedirs(d, exist_ok=True)
@@ -229,10 +232,11 @@ def scan_one(ns, ws, args, say):
                          plan_rows=p.get("rows"))
         meta = r.write_meta(finished_utc=_now(), step="done", outcome=outcome)
     except _Refused as e:
-        meta = _record_failure(r, outcome="refused", step=e.step, refusal=e.msg)
+        meta = _record_failure(r, outcome="refused", step=e.step, refusal=e.msg,
+                               step_seconds=secs)
     except Exception as e:  # noqa: BLE001 -- recorded in run.json; next target still runs
         meta = _record_failure(r, outcome="failed", step=step,
-                               error=f"{type(e).__name__}: {e}")
+                               error=f"{type(e).__name__}: {e}", step_seconds=secs)
     meta["_run"] = r
     return meta
 

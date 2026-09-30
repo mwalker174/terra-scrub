@@ -488,8 +488,6 @@ else
     echo "refusing: neither sha256sum nor shasum is on PATH -- cannot verify the URI list"
     exit 1
 fi
-command -v sleep >/dev/null 2>&1 || {{
-    echo "refusing: sleep is not on PATH -- cannot supervise the parallel deletes"; exit 1; }}
 GOT_SHA256="$(sha256 < "$URIS")"
 GOT_SHA256="${{GOT_SHA256%% *}}"
 if [ "$GOT_SHA256" != "$WANT_SHA256" ]; then
@@ -507,6 +505,8 @@ if [ "$GOT_LINES" -ne "$WANT_LINES" ]; then
     echo "refusing: URI list has $GOT_LINES lines but the plan has $WANT_LINES objects"
     exit 1
 fi
+command -v sleep >/dev/null 2>&1 || {{
+    echo "refusing: sleep is not on PATH -- cannot supervise the parallel deletes"; exit 1; }}
 
 # Split the list into $SHARDS contiguous pieces of $CHUNK lines, one deleter each.
 # One deleter runs at ~12 objects/s: it looks every URI up serially before deleting
@@ -542,12 +542,26 @@ fi
 # piece fails, or this script is interrupted, every other piece is stopped: each runs
 # in its own process group (set -m), which gets SIGTERM. Deletes already in flight
 # finish; verify then shows exactly what a partial run removed (docs/SAFETY.md §7).
+# An interrupted wrapper returns only after every piece has exited (a piece still
+# running after 30 s gets SIGKILL), so `clean` never starts verify under a live deleter.
 set -m
 RUNNING=""
 stop_all() {{
     for e in $RUNNING; do kill -TERM -- "-${{e#*:}}" 2>/dev/null || true; done
 }}
-trap 'echo "interrupted: stopping every piece"; stop_all; exit 130' INT TERM
+join_all() {{
+    t=0
+    for e in $RUNNING; do
+        p="${{e#*:}}"
+        while kill -0 "$p" 2>/dev/null; do
+            if [ "$t" -ge 30 ]; then kill -KILL -- "-$p" 2>/dev/null || true; fi
+            sleep 1
+            t=$((t + 1))
+        done
+        wait "$p" 2>/dev/null || true
+    done
+}}
+trap 'echo "interrupted: stopping every piece"; stop_all; join_all; exit 130' INT TERM
 i=1
 while [ "$i" -le "$SHARDS" ]; do
     gcloud storage rm -I < "$PART-$i" > "$PART-$i.log" 2>&1 &
@@ -568,8 +582,12 @@ while [ -n "$RUNNING" ]; do
             echo "piece $k/$SHARDS: done"
         else
             s=$?
-            echo "piece $k/$SHARDS: FAILED (rc=$s)"
-            if [ "$RC" -eq 0 ]; then RC=$s; fi
+            if [ "$STOPPED" -eq 1 ]; then
+                echo "piece $k/$SHARDS: stopped (rc=$s)"
+            else
+                echo "piece $k/$SHARDS: FAILED (rc=$s)"
+                if [ "$RC" -eq 0 ]; then RC=$s; fi
+            fi
         fi
     done
     RUNNING="$STILL"

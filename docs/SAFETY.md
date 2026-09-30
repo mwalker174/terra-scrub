@@ -363,10 +363,13 @@ separate actions:
    for 400k objects. Eight pieces take about 75 min.
    Each piece runs without `--continue-on-error` and stops at its first failed
    object. That piece's failure also stops the rest: each piece runs in its own
-   process group, and the wrapper sends SIGTERM to every group still running. It
-   does the same when it is interrupted (INT/TERM), so no deleter outlives it. It
-   refuses to start without `sleep` on `PATH`, because that is how it watches the
-   pieces. Stopping is not instant: deletes already in flight in the other pieces
+   process group, and the wrapper sends SIGTERM to every group still running; those
+   pieces are logged as `stopped`, and the wrapper exits with the failed piece's rc.
+   It does the same when it is interrupted (INT/TERM), and then waits for every
+   piece to exit (SIGKILL after 30 s) before it returns 130. So no deleter outlives
+   it, and `clean` never starts `verify` while a deleter is still running. After the
+   URI-list checks pass, it refuses to start without `sleep` on `PATH`, because that
+   is how it watches the pieces. Stopping is not instant: deletes already in flight in the other pieces
    finish, so a failed run can remove more than the objects before the failure.
    `verify` (§8) then shows exactly what a partial run removed, and you re-plan
    (inside the 24 h window) rather than retry blindly.

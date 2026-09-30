@@ -227,6 +227,8 @@ def test_scan_workspace_without_bucket_refuses(monkeypatch, tmp_path):
     assert calls == ["resolve"]
     assert "no bucketName" in res.stdout
     assert r is None     # nothing written for a workspace that never resolved
+    # ...but the time the failed resolve took is still reported
+    assert "time:" in res.stdout and "resolve " in res.stdout
 
 
 def test_scan_bad_target_refuses(monkeypatch, tmp_path):

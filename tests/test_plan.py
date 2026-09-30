@@ -461,7 +461,10 @@ def test_armed_wrapper_refuses_line_count_mismatch(tmp_path, run_plan_with_stub)
 
 
 FAKE_GCLOUD = """#!/bin/bash
-# fake deleter: records its argv and stdin, deletes nothing
+# fake deleter: records its argv and stdin, deletes nothing. On SIGTERM it takes
+# {linger} s to shut down (a real deleter finishing its in-flight requests), then
+# leaves an exit marker.
+trap 'sleep {linger}; echo gone > "{out}/exit.$$"; exit 143' TERM
 [ "$*" = "storage rm -I" ] || {{ echo "unexpected argv: $*"; exit 99; }}
 while IFS= read -r l; do printf '%s\\n' "$l"; done > "{out}/piece.$$"
 while IFS= read -r l; do
@@ -471,13 +474,13 @@ sleep {nap}
 """
 
 
-def _fake_gcloud_bin(tmp_path, *, fail_on="", nap=0):
+def _fake_gcloud_bin(tmp_path, *, fail_on="", nap=0, linger=0):
     b = _sha_only_bin(tmp_path, "fakebin")
     out = tmp_path / "fake-out"
     out.mkdir()
     g = os.path.join(b, "gcloud")
     with open(g, "w") as f:
-        f.write(FAKE_GCLOUD.format(out=out, fail_on=fail_on, nap=nap))
+        f.write(FAKE_GCLOUD.format(out=out, fail_on=fail_on, nap=nap, linger=linger))
     os.chmod(g, 0o755)
     return b, out
 
@@ -505,7 +508,7 @@ def test_sharded_wrapper_deletes_exactly_the_list_in_parallel(tmp_path, run_plan
     b, out = _fake_gcloud_bin(tmp_path)
     rr = _run_wrapper(p["commands_out"], b)
     assert rr.returncode == 0, rr.stdout + rr.stderr
-    pieces = sorted(os.listdir(out))
+    pieces = sorted(x for x in os.listdir(out) if x.startswith("piece."))
     assert len(pieces) == 2, f"one deleter per piece ({pieces})"
     fed = [ln for x in pieces for ln in _lines(out / x)]
     assert sorted(fed) == sorted(_lines(p["uris_out"])) and len(fed) == len(set(fed)), \
@@ -535,6 +538,8 @@ def test_one_failed_piece_stops_the_others(tmp_path, run_plan_with_stub):
     assert rr.returncode == 3, f"the failing piece's rc is the wrapper's rc ({rr.stdout})"
     assert "piece 1/5: FAILED (rc=3)" in rr.stdout and "stopping the others" in rr.stdout
     assert took < 15, f"the other pieces (napping 30 s) were stopped ({took:.1f}s)"
+    # the pieces we stopped are reported as stopped, not as further failures
+    assert rr.stdout.count("FAILED") == 1 and rr.stdout.count(": stopped (rc=") == 4, rr.stdout
 
 
 def test_interrupted_wrapper_leaves_no_deleter_running(tmp_path, run_plan_with_stub):
@@ -543,18 +548,22 @@ def test_interrupted_wrapper_leaves_no_deleter_running(tmp_path, run_plan_with_s
     import signal
     import time
     p = _armed_plan(tmp_path, run_plan_with_stub, "--shards", "3")
-    b, out = _fake_gcloud_bin(tmp_path, nap=30)
+    b, out = _fake_gcloud_bin(tmp_path, nap=30, linger=2)
     proc = subprocess.Popen([_bash(), p["commands_out"]], stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, text=True, env={"PATH": b})
     deadline = time.monotonic() + 10
-    while len(os.listdir(out)) < 3 and time.monotonic() < deadline:
+    while len([x for x in os.listdir(out) if x.startswith("piece.")]) < 3 \
+            and time.monotonic() < deadline:
         time.sleep(0.1)
-    pids = [int(x.split(".")[1]) for x in os.listdir(out)]
+    pids = [int(x.split(".")[1]) for x in os.listdir(out) if x.startswith("piece.")]
     assert len(pids) == 3, "all three pieces started"
     proc.send_signal(signal.SIGTERM)
     stdout, _ = proc.communicate(timeout=10)
     assert proc.returncode == 130 and "stopping every piece" in stdout, stdout
-    time.sleep(0.5)
+    # every deleter had finished shutting down (2 s each) BEFORE the wrapper returned:
+    # clean runs verify the moment it does
+    assert sorted(x for x in os.listdir(out) if x.startswith("exit.")) == \
+        sorted(f"exit.{pid}" for pid in pids), "the wrapper waited for every piece"
     alive = []
     for pid in pids:
         try:
@@ -571,6 +580,12 @@ def test_wrapper_refuses_without_sleep(tmp_path, run_plan_with_stub):
     os.unlink(os.path.join(b, "sleep"))
     rr = _run_wrapper(p["commands_out"], b)
     assert rr.returncode == 1 and "refusing: sleep is not on PATH" in rr.stdout, rr.stdout
+    # the URI-list checks come first: a modified list is reported as that, not as sleep
+    with open(p["uris_out"], "a") as f:
+        f.write(f"gs://{BUCKET}/submissions/aaaa1111/smuggled.bam\n")
+    rr = _run_wrapper(p["commands_out"], b)
+    assert rr.returncode == 1 and "sha256 changed" in rr.stdout \
+        and "sleep" not in rr.stdout, rr.stdout
 
 
 def test_shards_flag_is_bounded():
