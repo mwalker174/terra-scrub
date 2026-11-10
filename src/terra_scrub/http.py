@@ -52,5 +52,12 @@ def api_get(url, params=None, session=None, *, timeout=120):
     connection cannot hang a listing forever."""
     sess = session or _authed_session()
     r = sess.get(url, params=params, timeout=timeout)
-    r.raise_for_status()
+    if r.status_code >= 400:
+        import requests
+
+        # Terra/Sam put the actual reason (ToS not accepted, user not registered,
+        # wrong identity) in the body; raise_for_status() alone throws it away.
+        body = " ".join((r.text or "").split())[:400]
+        raise requests.HTTPError(f"{r.status_code} {r.reason} for url {r.url}"
+                                 + (f" -- {body}" if body else ""), response=r)
     return r
