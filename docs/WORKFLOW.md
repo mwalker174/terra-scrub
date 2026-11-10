@@ -308,6 +308,7 @@ A refusal is the tool doing its job. Fix the cause. Do not work around the gate.
 | refusal (where) | what it means | what to do |
 |---|---|---|
 | snapshot has no `__done__` marker / counts mismatch (`read_snapshot`) | truncated or partial listing | re-run `snapshot` to a new file |
+| `REFUSING: ... needs roughly N of RAM` (`read_snapshot` memory preflight) | the snapshot is too big for this machine: loading it would swap the desktop to death (~2.6 bytes of RAM per byte of snapshot file, limit 60% of physical RAM) | run on a bigger machine; `TERRA_SCRUB_ALLOW_LARGE_SNAPSHOT=1` only if you know the machine has the headroom |
 | snapshot older than N days (`candidates --max-snapshot-age`) | the listing is too old to base a delete list on | re-capture snapshot, then context |
 | context predates the snapshot (`candidates` capture-ordering guard) | the Terra read came before the listing, so a pointer written in between would look unreferenced | re-capture the **context** (after the listing) and regenerate |
 | context names a different bucket / has no bucket key (`candidates`, `stale`, `plan`) | wrong workspace for this bucket | find the right workspace with `lookup` |

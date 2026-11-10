@@ -30,8 +30,83 @@ OBJ_KEEP = ("name", "size", "updated", "md5Hash", "generation", "storageClass", 
 FIELDS_BUCKET = "id,name,location,versioning,storageClass,timeCreated"
 
 
+class SnapObj:
+    """One object line of a snapshot, held as compactly as Python allows.
+
+    A json.loads() dict of a snapshot line costs ~1.2 KB; a bucket of 7.7M objects
+    loaded that way needed ~9 GiB before `candidates` built anything on top of it,
+    and swapped a 24 GB laptop to death. Slots instead of a per-object dict, only
+    the keys a reader uses (storageClass/contentType stay in the file, unread) cut
+    that to roughly a third; what is left is mostly the object names themselves.
+
+    Read-only mapping interface (``o["name"]``, ``o.get("md5Hash")``, ``k in o``) so
+    callers written against the old dicts keep working unchanged.
+    """
+    __slots__ = ("generation", "md5Hash", "name", "size", "updated")
+
+    def __init__(self, name, size, updated, md5Hash, generation):
+        self.name = name
+        self.size = size
+        self.updated = updated
+        self.md5Hash = md5Hash
+        self.generation = generation
+
+    # A key the source line lacked is stored as None and reads as absent, exactly
+    # as it did when records were the json.loads() dicts.
+    def __getitem__(self, key):
+        v = getattr(self, key, None) if key in SnapObj.__slots__ else None
+        if v is None:
+            raise KeyError(key)
+        return v
+
+    def get(self, key, default=None):
+        v = getattr(self, key, None) if key in SnapObj.__slots__ else None
+        return default if v is None else v
+
+    def __contains__(self, key):
+        return key in SnapObj.__slots__ and getattr(self, key) is not None
+
+    def __repr__(self):
+        return f"SnapObj({self.name!r}, size={self.size})"
+
+
+# Preflight against loading a snapshot the machine cannot hold. Peak RSS of
+# `candidates` per byte of snapshot file, measured on samples of a real 7.7M-object
+# bucket (3.3 GB file): 2.6-4x, the high end on small files where the fixed cost of
+# the interpreter and terra context dominates. Refuse when the estimate exceeds
+# MEM_FRACTION of physical RAM: past that, macOS swaps the whole desktop into the
+# ground before Python ever raises MemoryError.
+MEM_PER_FILE_BYTE = 2.6
+MEM_FRACTION = 0.6
+ALLOW_LARGE_ENV = "TERRA_SCRUB_ALLOW_LARGE_SNAPSHOT"
+
+
+def _physical_memory():
+    """Bytes of physical RAM, or None where the platform will not say."""
+    try:
+        return os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+    except (ValueError, OSError, AttributeError):
+        return None
+
+
+def check_memory(path):
+    """SystemExit if loading ``path`` would likely exhaust this machine's RAM."""
+    if os.environ.get(ALLOW_LARGE_ENV) == "1":
+        return
+    phys = _physical_memory()
+    if not phys:
+        return
+    need = os.path.getsize(path) * MEM_PER_FILE_BYTE
+    if need > phys * MEM_FRACTION:
+        raise SystemExit(
+            f"REFUSING: {path} is {util.human(os.path.getsize(path))}; analyzing it needs "
+            f"roughly {util.human(int(need))} of RAM and this machine has "
+            f"{util.human(phys)} (limit {MEM_FRACTION:.0%}). Run on a machine with more "
+            f"memory, or set {ALLOW_LARGE_ENV}=1 to try anyway.")
+
+
 def read_snapshot(path, require_done=True):
-    """Parse a snapshot JSONL into (bucket_meta, [objects]).
+    """Parse a snapshot JSONL into (bucket_meta, [SnapObj]).
 
     When require_done (default), the `__done__` marker the snapshot writer
     appends must be present AND consistent with the file contents
@@ -40,6 +115,7 @@ def read_snapshot(path, require_done=True):
     (including the delete-list pipeline) must not run on a partial inventory.
     See docs/SAFETY.md.
     """
+    check_memory(path)
     meta, objs, done = None, [], None
     total_bytes = 0
     with open(path) as f:
@@ -57,10 +133,10 @@ def read_snapshot(path, require_done=True):
             elif "__done__" in rec:
                 done = rec
             else:
-                o = rec
-                o["size"] = int(o.get("size") or 0)
-                total_bytes += o["size"]
-                objs.append(o)
+                size = int(rec.get("size") or 0)
+                objs.append(SnapObj(rec["name"], size, rec.get("updated"), rec.get("md5Hash"),
+                                    rec.get("generation")))
+                total_bytes += size
     if meta is None:
         raise SystemExit(f"no bucket header in {path} — is this a snapshot file?")
     if require_done:
